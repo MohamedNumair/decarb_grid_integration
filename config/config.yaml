@@ -1,0 +1,84 @@
+# ============================================================
+# Building-Grid Integration Pipeline Configuration
+# ============================================================
+# This file controls all pipeline parameters. Copy it, edit for
+# your scenario, and pass the path to run_pipeline.py.
+# ============================================================
+
+# --- Date Range ---
+# Controls the simulation period.  Dates are "Mon DD" strings.
+# If start is AFTER end the window wraps around the new year
+# (e.g. start: "Dec 1", end: "Feb 28" → Dec + Jan + Feb).
+date_range:
+  start: "Jan 1"
+  end: "Dec 31"
+
+# --- Scope ---
+# "statewide" = all of Texas, GenX capacity expansion analysis
+# "zone"      = single zone/substation, OpenDSS distribution analysis
+scope: "zone"
+
+# --- Zone Settings (only used when scope = "zone") ---
+zone:
+  name: "P100U"               # zone to analyze
+  substation: null            # optional: specific substation within zone
+
+# --- Test Mode ---
+# When true, limits downloads and processing to a small subset
+test_mode: false
+test_limit: 600              # max buildings in the candidate pool (ignored when test_mode=false)
+
+# --- State & Geography ---
+state: "MA"
+state_full: "Massachusetts"
+year: 2018
+
+# --- Paths (relative to this config file's directory) ---
+paths:
+  project_root: ".."
+  input_dir: "../in"
+  output_dir: "../out"
+  network_dir: "D:/full_texas"
+  county_shapefile: "../in/us_county_boundaries/us-county-boundaries.shp"
+
+# --- ResStock / OEDI Data ---
+resstock:
+  release: "resstock_amy2018_release_1"
+  release_year: 2025
+  s3_bucket: "oedi-data-lake"
+
+# --- API Keys (override via .env file) ---
+api_keys:
+  nrel: null                  # set in .env as NREL_API_KEY
+
+# --- Matching Flags ---
+matching:
+  download_kvar: false        # download missing res_kvar files from S3 before PV detection
+  usage_limit: auto            # max times a building can be matched ("auto" = ceil(12 × buses/buildings))
+
+# --- Schedule & Setpoint Settings ---
+schedules:
+  method: "history"           # "history" = from consumption data (indoor vs outdoor temp)
+                              # "metadata" = from ResStock metadata (setpoint offset fields)
+  resolution: "15min"         # timeseries resolution
+  hysteresis:                 # only used by history method
+    heat_enter: 0.80
+    heat_exit: 0.70
+    cool_enter: 0.20
+    cool_exit: 0.30
+    smoothing_days: 28
+
+# --- Pipeline Stage Toggles ---
+stages:
+  data_acquisition: false      # already done
+  thermal_model: false         # already done
+  feeder_processing: false
+  building_matching: false
+  schedules: false
+  heatpump_selection: false
+
+# --- Heat Pump Selection ---
+heatpump:
+  neep_database: null         # path to NEEP CSV/Excel (null = input_dir/neep_database.csv)
+  sizing_percentile: 95       # percentile of nonzero load for sizing
+  max_units: 10               # max identical units to try if single unit insufficient

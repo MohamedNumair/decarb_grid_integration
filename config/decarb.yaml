@@ -1,0 +1,100 @@
+# ============================================================
+# DECARB Input Generation Configuration
+# ============================================================
+# Controls what optimization scenarios to generate for DECARB.
+# Each "case" is a combination of:
+#   electrification level × tariff × solar penetration
+# ============================================================
+
+# --- Timestep ---
+timestep: "hourly"          # "hourly" or "15min"
+
+# --- Electrification ---
+electrification:
+  levels:
+    - 0                     # baseline (existing HVAC systems)
+    - 100                   # full electrification (all fossil → heat pump)
+  # When level > 0, buildings with fossil heating get a heat pump
+  # from the hp_summary. Buildings already on heat pumps keep theirs.
+
+# --- Tariff Schedules ---
+# Each tariff can optionally include a capacity_charge block.
+# If omitted, no capacity charge is applied for that tariff.
+tariffs:
+  - name: "flat"
+    type: "flat"
+    rate: 0.22              # $/kWh
+    sell_rate: 0.18         # $/kWh sell-back rate
+
+  - name: "tou"
+    type: "tou"
+    rate: 0.16              # $/kWh off-peak
+    sell_rate: 0.18
+    peak_windows:           # two peak windows per day
+      - start: "06:00"
+        end: "10:00"
+      - start: "19:00"
+        end: "23:00"
+    peak_price: 0.32        # $/kWh on-peak
+
+  - name: "flat_cap"
+    type: "flat"
+    rate: 0.22
+    sell_rate: 0.18
+    capacity_charge:
+      enabled: true
+      charge_value: 250     # $/kW — applies to peak demand across ALL hours
+
+  - name: "tou_cap"
+    type: "tou"
+    rate: 0.16
+    sell_rate: 0.18
+    peak_windows:
+      - start: "06:00"
+        end: "10:00"
+      - start: "19:00"
+        end: "23:00"
+    peak_price: 0.32
+    capacity_charge:
+      enabled: true
+      charge_value: 250     # $/kW — applies to peak demand across ALL hours
+
+# --- Capacity Charge (global fallback) ---
+capacity_charge:
+  enabled: false
+
+# --- Fuel Costs ---
+fuel_costs:
+  co2: 0.5                  # $/kg CO2
+  gas: 0.051                # $/kWh natural gas
+  liquid: 0.0739            # $/kWh fuel oil/propane
+
+# --- Rooftop Solar ---
+# DECARB always runs at 0% and 100% (bookends).
+# Intermediate penetration levels are handled at the network
+# demand stage by randomly selecting which buildings contribute
+# their solar profile.
+rooftop_solar:
+  enabled: true             # generate solar parameters for all buildings
+  seed: 42                  # random seed for intermediate allocation
+
+# --- Output File Selection ---
+# Set to false to skip generating specific files
+outputs:
+  tm: true                  # tm.csv — timeseries model (tariff, weather, loads)
+  bdg_i: true               # bdg_i.csv — building envelope parameters
+  bdg_ii: true              # bdg_ii.csv — thermal model regression coefficients
+  in: true                  # in.csv — initial conditions
+  other: true               # abs.csv, pv.csv, bess.csv, wind.csv, ev.csv
+  chp: true                 # chp.csv — combined heat & power / boiler options
+  topo: true                # topo.csv — energy system topology
+  hvac: true                # hvac.csv — HVAC system options
+  wh: true                  # wh.csv — water heater options
+  sp: true                  # sp.csv — starting point (existing equipment)
+
+# --- Template Directory ---
+# Path to DECARB CSV templates (relative to this config file)
+template_dir: "../in/decarb_input_templates"
+
+# --- Workers ---
+max_workers: 4              # parallel processes for batch generation

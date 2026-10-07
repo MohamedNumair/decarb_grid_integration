@@ -1,0 +1,44 @@
+# ============================================================
+# Network Analysis Configuration
+# ============================================================
+# Controls how DECARB outputs get mapped back onto the grid
+# for GenX (statewide) or OpenDSS (zone) analysis.
+#
+# The scope (statewide vs zone) comes from config.yaml.
+# ============================================================
+
+# --- GenX Settings (used when scope = "statewide") ---
+genx:
+  # Path to the pre-built GenX base case directory.
+  # This directory contains all supply-side files (Thermal.csv,
+  # Vre.csv, Storage.csv, Fuels_data.csv, Generators_variability.csv,
+  # Network.csv) generated once from Texas7k + EIA data.
+  # Per-study, this gets copied and Demand_data.csv is overwritten.
+  base_case: null             # path to genx base case dir (e.g. "../in/genx_base")
+
+  # Demand aggregation mode
+  network_mode: "1bus"          # "1bus" = single zone, "7kbus" = full network
+  n_hours: 8760                 # simulation hours (full year)
+  bus_mapping: null             # path to bus mapping CSV (required for 7kbus mode)
+
+  # GenX demand metadata (written into Demand_data.csv row 1)
+  voll: 2000000                 # value of lost load ($/MWh)
+  demand_segment: 1
+  cost_curtailment: 1           # cost of demand curtailment per MW
+  max_curtailment: 1
+  cost_mwh: 2000
+
+# --- OpenDSS Settings (used when scope = "zone") ---
+opendss:
+  period: "yearly"              # "daily", "monthly", "yearly"
+  resolution: "15min"           # simulation timestep
+
+# --- Interpolation ---
+# When enabled, interpolate_demand.py computes intermediate electrification
+# and PV penetration levels between 0% and 100% bookend cases.
+# When disabled, network-inputs aggregates directly from DECARB outputs.
+interpolation:
+  enabled: false
+
+# --- Workers ---
+max_workers: 4
