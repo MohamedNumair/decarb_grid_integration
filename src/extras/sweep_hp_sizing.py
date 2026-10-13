@@ -45,7 +45,7 @@ except ImportError:
 from create_network_inputs import find_study_dir
 from heatpump_selection import (
     load_neep_heat_pumps, read_parquet, build_cost_menu,
-    find_multi_unit_options, capacity_at_temp,
+    find_multi_unit_options, capacity_at_temp, get_sizing_settings,
     _sizing_load_and_temp, _absolute_peak_load_and_temp,
     CONSUMPTION_COLS, METADATA_COLS,
 )
@@ -76,7 +76,7 @@ KW_TO_BTU = 3412.14
 # ---------------------------------------------------------------------------
 
 def select_hp_for_building(building_id, hp_base, metadata_df, consumption_dir,
-                           percentile):
+                           percentile, max_units):
     """Run HP selection for one building at the given sizing percentile.
 
     percentile <= 100: use that percentile of nonzero heating/cooling loads.
@@ -160,7 +160,7 @@ def select_hp_for_building(building_id, hp_base, metadata_df, consumption_dir,
     n_sufficient = result["sufficient_capacity"].sum()
 
     if n_sufficient == 0:
-        hp_multi, n_units = find_multi_unit_options(result, sizing_h, sizing_c)
+        hp_multi, n_units = find_multi_unit_options(result, sizing_h, sizing_c, max_units)
         if hp_multi is None:
             return None, {"bldg_id": building_id, "peak_load_btu_hr": abs_h}
         hp_multi = build_cost_menu(hp_multi, sqft, has_ducts)
@@ -204,6 +204,7 @@ def run_hp_selection_at_percentile(cfg, hp_base, building_ids, percentile):
     metadata_df = read_parquet(metadata_path, columns=METADATA_COLS).set_index("bldg_id")
 
     consumption_dir = input_dir / "residential_profiles" / state
+    _, max_units = get_sizing_settings(cfg)
 
     label = f"{percentile}th pct" if percentile <= 100 else f"{percentile}% of peak"
     log.info(f"Running HP selection at {label} for {len(building_ids)} buildings...")
@@ -212,7 +213,7 @@ def run_hp_selection_at_percentile(cfg, hp_base, building_ids, percentile):
     failed = 0
     for i, bldg_id in enumerate(building_ids, 1):
         metrics, zero = select_hp_for_building(
-            bldg_id, hp_base, metadata_df, consumption_dir, percentile)
+            bldg_id, hp_base, metadata_df, consumption_dir, percentile, max_units)
         if metrics is not None:
             summary_rows.append(metrics)
         else:

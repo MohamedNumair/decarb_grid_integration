@@ -15,13 +15,12 @@ date_range:
 
 # --- Scope ---
 # "statewide" = all of Texas, GenX capacity expansion analysis
-# "zone"      = single zone/substation, OpenDSS distribution analysis
+# "zone"      = single zone, OpenDSS distribution analysis
 scope: "zone"
 
 # --- Zone Settings (only used when scope = "zone") ---
 zone:
   name: "P100U"               # zone to analyze
-  substation: null            # optional: specific substation within zone
 
 # --- Test Mode ---
 # When true, limits downloads and processing to a small subset
@@ -47,14 +46,14 @@ resstock:
   release_year: 2025
   s3_bucket: "oedi-data-lake"
 
-# --- API Keys (override via .env file) ---
-api_keys:
-  nrel: null                  # set in .env as NREL_API_KEY
-
 # --- Matching Flags ---
 matching:
-  download_kvar: false        # download missing res_kvar files from S3 before PV detection
-  usage_limit: auto            # max times a building can be matched ("auto" = ceil(12 × buses/buildings))
+  download_network_profiles: false  # download missing SMART-DS kw + kvar loadshape profiles referenced by the feeders (required by OpenDSS)
+  usage_limit: auto            # max times a building can be matched (integer, or "auto" — see usage_multiplier)
+  usage_multiplier: 15         # used when usage_limit = "auto":
+                               #   usage_limit = ceil(usage_multiplier × n_buses / n_buildings)
+                               # n_buses/n_buildings is the reuse an even spread needs; the multiplier
+                               # lets a well-matching building be reused up to that many times more
 
 # --- Schedule & Setpoint Settings ---
 schedules:

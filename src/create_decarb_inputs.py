@@ -1,5 +1,4 @@
 import csv
-import json
 import logging
 import re
 import shutil
@@ -50,18 +49,32 @@ def read_parquet(path):
 # Elevation lookup
 # ---------------------------------------------------------------------------
 
-def fetch_elevation_usgs(lat, lon):
+ELEVATION_MAX_RETRIES = 3
+EPQS_NO_DATA = -1000000      # value EPQS returns for points with no elevation data
+
+
+def fetch_elevation_usgs(lat, lon, max_retries=ELEVATION_MAX_RETRIES):
+    """Return (elevation_m, None) on success or (None, error_message)."""
     url = f"https://epqs.nationalmap.gov/v1/json?x={lon}&y={lat}&units=Meters&includeDate=false"
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        return float(resp.json()["value"])
-    except Exception:
-        return 0.0
+    error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            value = float(resp.json()["value"])
+            if value <= EPQS_NO_DATA:
+                return None, "USGS has no elevation data for this point"
+            return value, None
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+    return None, error
 
 
 def build_elevation_cache(unique_coords, max_workers=20):
     cache = {}
+    failed = {}
     log.info(f"Fetching elevation for {len(unique_coords)} unique coordinates")
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
@@ -70,7 +83,19 @@ def build_elevation_cache(unique_coords, max_workers=20):
         }
         for future in as_completed(futures):
             coord = futures[future]
-            cache[coord] = future.result()
+            value, error = future.result()
+            if error is None:
+                cache[coord] = value
+            else:
+                failed[coord] = error
+
+    if failed:
+        examples = "\n".join(f"  lat={lat}, lon={lon}: {err}"
+                             for (lat, lon), err in list(failed.items())[:10])
+        raise RuntimeError(
+            f"Elevation lookup failed for {len(failed)} of {len(unique_coords)} "
+            f"coordinates (USGS EPQS, {ELEVATION_MAX_RETRIES} attempts each):\n{examples}\n"
+            f"The service may be down or rate-limiting; try again later.")
     return cache
 
 
@@ -577,7 +602,7 @@ def create_bdg_i_file(output_dir, template, building_row,
 
     lat = float(building_row["in.weather_file_latitude"].iloc[0])
     lon = float(building_row["in.weather_file_longitude"].iloc[0])
-    set_val("pBalt", elevation_cache.get((lat, lon), 0.0))
+    set_val("pBalt", elevation_cache[(lat, lon)])
     set_val("pBlat", lat)
     set_val("pBlon", lon)
 
@@ -609,7 +634,7 @@ def create_bdg_i_file(output_dir, template, building_row,
 def create_bdg_ii_file(output_dir, bldg_id, regression_coeffs):
     key = str(bldg_id)
     if key not in regression_coeffs:
-        raise KeyError(f"Building {bldg_id} not found in regression_coeff.json")
+        raise KeyError(f"Building {bldg_id} not found in the thermal model results")
     coeffs = regression_coeffs[key]
     pd.DataFrame([{
         "pBk1": coeffs["k1"],
@@ -1171,6 +1196,15 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
     year = cfg["year"]
     outputs = dcfg["outputs"]
 
+    # Check thermal model results before creating a study directory
+    from fit_thermal_model import thermal_coeff_csv_path
+    coeff_csv = thermal_coeff_csv_path(cfg)
+    if outputs["bdg_ii"] and not coeff_csv.exists():
+        raise FileNotFoundError(
+            f"No thermal model results at {coeff_csv}. Run the thermal model stage "
+            f"first (stages.thermal_model: true in config.yaml), or set "
+            f"outputs.bdg_ii: false in decarb.yaml.")
+
     if study_dir is not None:
         # Use the provided existing study directory
         study_dir = Path(study_dir)
@@ -1241,11 +1275,7 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
     meta_path = input_dir / f"{state}_upgrade0.parquet"
     metadata_df = read_parquet(meta_path)
 
-    # Load regression coefficients (prefer CSV over JSON — CSV is always fresh)
-    coeff_csv = (output_dir / "thermal_model_outputs" / state / "baseline_internal_gains"
-                 / "regression_coeff_baseline_internal_gains.csv")
-    coeff_json = coeff_csv.with_suffix(".json")
-
+    # Load regression coefficients from the thermal model stage
     regression_coeffs = {}
     if coeff_csv.exists():
         coeff_df = pd.read_csv(str(coeff_csv))
@@ -1255,11 +1285,12 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
                 "k2": float(row["k2"]),
                 "k3": float(row["k3"]),
             }
-        log.info(f"Loaded regression coefficients for {len(regression_coeffs)} buildings")
-    elif coeff_json.exists():
-        with open(str(coeff_json), "r") as f:
-            regression_coeffs = json.load(f)
-        log.info(f"Loaded regression coefficients (JSON) for {len(regression_coeffs)} buildings")
+        log.info(f"Loaded regression coefficients for {len(regression_coeffs)} buildings "
+                 f"from {coeff_csv}")
+        if not regression_coeffs and outputs["bdg_ii"]:
+            raise ValueError(
+                f"Thermal model results at {coeff_csv} contain no buildings. "
+                f"Check the thermal model stage log for why no fits succeeded.")
 
     if regression_coeffs:
         fitted_ids = set(int(k) for k in regression_coeffs.keys())
@@ -1269,9 +1300,9 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
             log.info(f"Filtered to {len(building_ids)}/{before} buildings "
                      f"with thermal model results")
     else:
-        log.warning("Regression coefficients not found, bdg_ii will be skipped")
-        outputs = dict(outputs)
-        outputs["bdg_ii"] = False
+        # Only reachable with outputs.bdg_ii: false (checked above)
+        log.warning("No thermal model results; bdg_ii is off and the building "
+                    "list is not filtered to fitted buildings")
 
     # Load HP summary
     hp_summary_path = output_dir / "heatpump_files" / state / "building_hp_summary.csv"
@@ -1290,8 +1321,9 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
         lon_col = "in.weather_file_longitude"
         id_col = "bldg_id" if "bldg_id" in metadata_df.columns else "building_id"
         subset = metadata_df[metadata_df[id_col].isin(building_ids)]
+        # float keys, matching the float(...) lookups in create_bdg_i_file
         unique_coords = list(
-            subset[[lat_col, lon_col]].drop_duplicates().itertuples(
+            subset[[lat_col, lon_col]].astype(float).drop_duplicates().itertuples(
                 index=False, name=None))
         elevation_cache = build_elevation_cache(unique_coords, max_workers=20)
 

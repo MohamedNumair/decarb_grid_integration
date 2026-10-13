@@ -48,8 +48,10 @@ LIGHTING_FRACTION  = 1.0
 EQUIPMENT_FRACTION = 1.0
 DHW_FRACTION       = 0
 
+THERMAL_FEATURE_SET = "baseline_internal_gains"
+
 FEATURE_SETS = {
-    "baseline_internal_gains": {
+    THERMAL_FEATURE_SET: {
         "temp_diff_lag":               ["outdoor_temp_c", "indoor_temp_c"],
         "radiation":                   "solar_radiation_w",
         "internal_gains_minus_cool_w": [
@@ -62,6 +64,13 @@ FEATURE_SETS = {
         ],
     },
 }
+
+
+def thermal_coeff_csv_path(cfg, feature_name=THERMAL_FEATURE_SET):
+    """Path of the regression coefficient CSV written by the thermal model
+    stage and read by building matching and DECARB input generation."""
+    return (cfg["paths"]["output_dir"] / "thermal_model_outputs" / cfg["state"]
+            / feature_name / f"regression_coeff_{feature_name}.csv")
 
 
 # ============================================================
@@ -92,7 +101,13 @@ def newey_west_cov(X, residuals, n_lags=None):
 # ============================================================
 # Create building timeseries from parquet files
 # ============================================================
-def create_building_timeseries(bldg_ids, cfg, save_outputs=False):
+def create_building_timeseries(bldg_ids, cfg, save_outputs=False, skipped=None):
+    """Build per-building model inputs. Buildings that can't be used are
+    appended to `skipped` (if given) as {"bldg_id", "reason"}."""
+    def _skip(bid, reason):
+        if skipped is not None:
+            skipped.append({"bldg_id": int(bid), "reason": reason})
+
     input_dir = cfg["paths"]["input_dir"]
     output_dir = cfg["paths"]["output_dir"]
     state = cfg["state"]
@@ -117,24 +132,31 @@ def create_building_timeseries(bldg_ids, cfg, save_outputs=False):
         bldg_id = row["bldg_id"]
         sqm     = row["sqm"]
 
-        if pd.isna(bldg_id) or pd.isna(sqm):
+        if pd.isna(bldg_id):
+            continue
+        if pd.isna(sqm):
+            _skip(bldg_id, "not in metadata or no floor area")
             continue
 
         bldg_path = profiles_dir / f"{bldg_id}-0.parquet"
         if not bldg_path.exists():
+            _skip(bldg_id, "profile file missing")
             continue
 
         try:
             df_bldg = read_parquet(bldg_path)
             if "timestamp" not in df_bldg.columns:
+                _skip(bldg_id, "missing column: timestamp")
                 continue
 
             df_bldg["datetime"] = pd.to_datetime(df_bldg["timestamp"])
             df_cols = df_bldg.columns
 
             if TS_CONFIG["indoor_temp_key"] not in df_cols:
+                _skip(bldg_id, f"missing column: {TS_CONFIG['indoor_temp_key']}")
                 continue
             if OUTDOOR_TEMP_COL not in df_cols:
+                _skip(bldg_id, f"missing column: {OUTDOOR_TEMP_COL}")
                 continue
 
             for load_key in ("cooling_load_key", "heating_load_key"):
@@ -147,6 +169,7 @@ def create_building_timeseries(bldg_ids, cfg, save_outputs=False):
             has_humidity = HUMIDITY_COL in df_cols
 
             if not has_solar:
+                _skip(bldg_id, f"missing column: {SOLAR_COL}")
                 continue
 
             has_lighting  = LIGHTING_COL  in df_cols
@@ -199,6 +222,7 @@ def create_building_timeseries(bldg_ids, cfg, save_outputs=False):
 
         except Exception as e:
             log.warning(f"Error reading {bldg_id}-0.parquet: {e}")
+            _skip(bldg_id, f"read error: {type(e).__name__}")
             continue
 
         all_ts_dict[int(bldg_id)] = df_bldg.copy()
@@ -214,14 +238,19 @@ def create_building_timeseries(bldg_ids, cfg, save_outputs=False):
 # ============================================================
 # Compute regression coefficients
 # ============================================================
-def compute_regression_coefficients(all_ts_dict, required_columns=None):
+def compute_regression_coefficients(all_ts_dict, required_columns=None, skipped=None):
+    def _skip(bid, reason):
+        if skipped is not None:
+            skipped.append({"bldg_id": int(bid), "reason": reason})
+
     results = []
 
     if required_columns is None:
-        required_columns = FEATURE_SETS["baseline_internal_gains"]
+        required_columns = FEATURE_SETS[THERMAL_FEATURE_SET]
 
     for bldg_id, df in all_ts_dict.items():
         if df.shape[0] < 2:
+            _skip(bldg_id, "fewer than 2 timesteps")
             continue
 
         df["cooling_load_w"] = df["cooling_load_w"].fillna(0)
@@ -260,6 +289,7 @@ def compute_regression_coefficients(all_ts_dict, required_columns=None):
                 X_dict[feature_name] = df[col_spec]
 
         if skip_building or not X_dict:
+            _skip(bldg_id, "missing model feature columns")
             continue
 
         X = pd.DataFrame(X_dict)
@@ -270,6 +300,7 @@ def compute_regression_coefficients(all_ts_dict, required_columns=None):
         y = y.loc[valid_idx]
 
         if X.shape[0] < 2:
+            _skip(bldg_id, "fewer than 2 valid rows after dropping NaNs")
             continue
 
         X_vals = X.values.astype(np.float64)
@@ -328,60 +359,58 @@ def compute_regression_coefficients(all_ts_dict, required_columns=None):
 
 
 # ============================================================
-# Save results as JSON
-# ============================================================
-def _save_results_json(results_df, json_dir, feature_name):
-    json_dir.mkdir(parents=True, exist_ok=True)
-    out_json = json_dir / f"regression_coeff_{feature_name}.json"
-    keep_cols = ["k1", "k2", "k3", "f_pval", "r_squared", "mse"]
-
-    buildings_dict = {}
-    for _, row in results_df.iterrows():
-        bldg_key = str(int(row["bldg_id"]))
-        bldg_record = {}
-        for col in keep_cols:
-            if col not in row.index:
-                continue
-            val = row[col]
-            if isinstance(val, (np.floating,)):
-                bldg_record[col] = None if np.isnan(val) else float(val)
-            elif isinstance(val, (np.integer,)):
-                bldg_record[col] = int(val)
-            else:
-                bldg_record[col] = val
-        buildings_dict[bldg_key] = bldg_record
-
-    with open(out_json, "w") as f:
-        json.dump(buildings_dict, f, indent=2)
-
-    return out_json
-
-
-# ============================================================
 # Batch worker
 # ============================================================
 def _worker(args):
     (batch_idx, batch_ids, cfg, feature_sets, save_outputs, tmp_dir) = args
 
+    skipped = []
     try:
         ts_dict = create_building_timeseries(
-            bldg_ids=batch_ids, cfg=cfg, save_outputs=save_outputs,
+            bldg_ids=batch_ids, cfg=cfg, save_outputs=save_outputs, skipped=skipped,
         )
 
         counts = {}
         for feature_name, feature_cols in feature_sets.items():
             results = compute_regression_coefficients(
-                all_ts_dict=ts_dict, required_columns=feature_cols,
+                all_ts_dict=ts_dict, required_columns=feature_cols, skipped=skipped,
             )
             if results:
                 tmp_file = tmp_dir / f"{feature_name}_batch_{batch_idx:06d}.parquet"
                 pd.DataFrame(results).to_parquet(tmp_file, index=False)
             counts[feature_name] = len(results)
 
-        return counts
+        return counts, skipped
 
     except Exception as e:
-        return f"ERROR in batch {batch_idx}: {e}"
+        reason = f"batch error: {type(e).__name__}: {e}"
+        return f"ERROR in batch {batch_idx}: {e}", [
+            {"bldg_id": int(b), "reason": reason} for b in batch_ids]
+
+
+def _report_skipped(skipped, results_dir, n_input):
+    """Save the skipped-building list and log a count per reason."""
+    skipped_df = pd.DataFrame(skipped, columns=["bldg_id", "reason"])
+    skipped_df = skipped_df.drop_duplicates().sort_values("bldg_id")
+    skipped_csv = results_dir / "skipped_buildings.csv"
+    skipped_df.to_csv(skipped_csv, index=False)
+
+    if skipped_df.empty:
+        log.info(f"No buildings skipped ({n_input} input)")
+        return skipped_csv
+
+    log.warning(f"Skipped {skipped_df['bldg_id'].nunique()} of {n_input} buildings "
+                f"(list: {skipped_csv}):")
+    for reason, n in skipped_df["reason"].value_counts().items():
+        log.warning(f"  {n:>6}  {reason}")
+    return skipped_csv
+
+
+def _raise_if_nothing_fitted(n_fitted, feature_name, skipped_csv):
+    if n_fitted == 0:
+        raise RuntimeError(
+            f"Thermal model fitted 0 buildings for {feature_name}. "
+            f"See {skipped_csv} for why each building was skipped.")
 
 
 # ============================================================
@@ -390,10 +419,8 @@ def _worker(args):
 def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
                  batch=True, batch_size=100, n_workers=20):
     output_dir = cfg["paths"]["output_dir"]
-    input_dir = cfg["paths"]["input_dir"]
     state = cfg["state"]
     results_dir = output_dir / "thermal_model_outputs" / state
-    json_dir = input_dir / "residential_profiles" / state
 
     if feature_sets is None:
         feature_sets = FEATURE_SETS
@@ -411,7 +438,7 @@ def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
             "constraints": "All coefficients (k1, k2, k3) constrained >= 0",
             "model_form": "T_in(t) = T_in(t-1) + k1*[T_out(t-1)-T_in(t-1)] + k2*Q_rad(t) + k3*[Q_net(t-1)]",
             "standard_errors": "Newey-West HAC, auto lag = int(4*(T/100)^(2/9))",
-            "output_formats": ["csv", "parquet", "json"],
+            "output_formats": ["csv", "parquet"],
             "batched": batch,
             "batch_size": batch_size if batch else None,
             "n_workers": n_workers if batch else None,
@@ -426,6 +453,15 @@ def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
         tmp_dir = results_dir / "_tmp_batch_results"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
+        # Leftovers from a run that crashed before merging would otherwise be
+        # merged into this run's results
+        stale = list(tmp_dir.glob("*_batch_*.parquet"))
+        if stale:
+            log.warning(f"Removing {len(stale)} leftover batch file(s) from an "
+                        f"earlier interrupted run in {tmp_dir}")
+            for f in stale:
+                f.unlink()
+
         log.info(f"Running: {total} buildings, {n_batches} batches of {batch_size}, {n_workers} workers")
 
         worker_args = [
@@ -434,13 +470,14 @@ def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
         ]
 
         t_start = time.time()
-        completed, errors = 0, []
+        completed, errors, skipped = 0, [], []
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
             futures = {executor.submit(_worker, args): args[0] for args in worker_args}
             for future in concurrent.futures.as_completed(futures):
                 batch_idx = futures[future]
-                result    = future.result()
+                result, batch_skipped = future.result()
+                skipped.extend(batch_skipped)
                 completed += 1
 
                 if isinstance(result, str):
@@ -454,21 +491,18 @@ def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
         if errors:
             log.error(f"{len(errors)} batch(es) failed")
 
+        skipped_csv = _report_skipped(skipped, results_dir, total)
+
         log.info("Merging batch results...")
         for feature_name in feature_sets:
             tmp_files = sorted(tmp_dir.glob(f"{feature_name}_batch_*.parquet"))
-            if not tmp_files:
-                log.warning(f"No results for {feature_name}")
-                continue
+            _raise_if_nothing_fitted(len(tmp_files), feature_name, skipped_csv)
 
             merged_df = pd.concat([pd.read_parquet(f) for f in tmp_files], ignore_index=True)
-            feat_dir    = results_dir / feature_name
-            out_csv     = feat_dir / f"regression_coeff_{feature_name}.csv"
-            out_parquet = feat_dir / f"regression_coeff_{feature_name}.parquet"
+            out_csv     = thermal_coeff_csv_path(cfg, feature_name)
+            out_parquet = out_csv.with_suffix(".parquet")
             merged_df.to_csv(out_csv, index=False)
             merged_df.to_parquet(out_parquet, index=False)
-
-            _save_results_json(merged_df, json_dir, feature_name)
             log.info(f"Saved {feature_name}: {len(merged_df)} buildings -> {out_csv}")
 
             for f in tmp_files:
@@ -482,22 +516,26 @@ def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
     else:
         log.info(f"Running single-pass: {total} buildings")
 
+        skipped = []
         ts_dict = create_building_timeseries(
-            bldg_ids=bldg_ids_list, cfg=cfg, save_outputs=save_outputs,
+            bldg_ids=bldg_ids_list, cfg=cfg, save_outputs=save_outputs, skipped=skipped,
         )
 
-        for feature_name, feature_cols in feature_sets.items():
-            results = compute_regression_coefficients(
-                all_ts_dict=ts_dict, required_columns=feature_cols,
+        all_results = {
+            feature_name: compute_regression_coefficients(
+                all_ts_dict=ts_dict, required_columns=feature_cols, skipped=skipped,
             )
+            for feature_name, feature_cols in feature_sets.items()
+        }
+        skipped_csv = _report_skipped(skipped, results_dir, total)
+
+        for feature_name, results in all_results.items():
+            _raise_if_nothing_fitted(len(results), feature_name, skipped_csv)
             results_df = pd.DataFrame(results)
-            feat_dir    = results_dir / feature_name
-            out_csv     = feat_dir / f"regression_coeff_{feature_name}.csv"
-            out_parquet = feat_dir / f"regression_coeff_{feature_name}.parquet"
+            out_csv     = thermal_coeff_csv_path(cfg, feature_name)
+            out_parquet = out_csv.with_suffix(".parquet")
             results_df.to_csv(out_csv, index=False)
             results_df.to_parquet(out_parquet, index=False)
-
-            _save_results_json(results_df, json_dir, feature_name)
             log.info(f"Saved {feature_name}: {len(results_df)} buildings -> {out_csv}")
 
 

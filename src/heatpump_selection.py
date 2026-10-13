@@ -196,7 +196,7 @@ def _absolute_peak_load_and_temp(load_series, temp_series):
     return load_series.loc[idx] * 4000, temp_series.loc[idx] * 1.8 + 32
 
 
-def get_peak_loads(consumption_df, conditioned_area_sqft, percentile=95.0):
+def get_peak_loads(consumption_df, conditioned_area_sqft, percentile):
     temp_series = consumption_df["out.outdoor_air_drybulb_temp..c"]
 
     heating_series = consumption_df["out.load.heating.energy_delivered..kbtu"]
@@ -226,9 +226,9 @@ def get_peak_loads(consumption_df, conditioned_area_sqft, percentile=95.0):
 # Capacity filtering & multi-unit matching
 # ---------------------------------------------------------------------------
 
-def get_capacity_at_design_temp(hp_df, consumption_df, conditioned_area_sqft):
+def get_capacity_at_design_temp(hp_df, consumption_df, conditioned_area_sqft, percentile):
     (sizing_h, sizing_ht, sizing_c, sizing_ct,
-     abs_h, abs_ht, abs_c, abs_ct) = get_peak_loads(consumption_df, conditioned_area_sqft)
+     abs_h, abs_ht, abs_c, abs_ct) = get_peak_loads(consumption_df, conditioned_area_sqft, percentile)
 
     outdoor_c_h = (sizing_ht - 32) / 1.8
     outdoor_c_c = (sizing_ct - 32) / 1.8
@@ -245,7 +245,7 @@ def get_capacity_at_design_temp(hp_df, consumption_df, conditioned_area_sqft):
     return result, sizing_h, sizing_ht, sizing_c, sizing_ct, abs_h, abs_ht, abs_c, abs_ct
 
 
-def find_multi_unit_options(hp_df, peak_load_heating, peak_load_cooling, max_units=10):
+def find_multi_unit_options(hp_df, peak_load_heating, peak_load_cooling, max_units):
     for n in range(2, max_units + 1):
         h_per = peak_load_heating / n
         c_per = peak_load_cooling / n
@@ -288,7 +288,7 @@ def build_cost_menu(hp_df, conditioned_area_sqft, has_ductwork):
 # Per-building processing
 # ---------------------------------------------------------------------------
 
-def process_building(building_id, hp_base, metadata_df, consumption_dir):
+def process_building(building_id, hp_base, metadata_df, consumption_dir, percentile, max_units):
     if building_id not in metadata_df.index:
         return None, None
 
@@ -308,7 +308,7 @@ def process_building(building_id, hp_base, metadata_df, consumption_dir):
 
     try:
         (hp_df, sizing_h, sizing_ht, sizing_c, sizing_ct,
-         abs_h, abs_ht, abs_c, abs_ct) = get_capacity_at_design_temp(hp_base, consumption_df, sqft)
+         abs_h, abs_ht, abs_c, abs_ct) = get_capacity_at_design_temp(hp_base, consumption_df, sqft, percentile)
     except Exception as e:
         log.warning(f"Building {building_id}: sizing failed — {e}")
         return None, None
@@ -316,7 +316,7 @@ def process_building(building_id, hp_base, metadata_df, consumption_dir):
     n_sufficient = hp_df["sufficient_capacity"].sum()
 
     if n_sufficient == 0:
-        hp_multi, n_units = find_multi_unit_options(hp_df, sizing_h, sizing_c)
+        hp_multi, n_units = find_multi_unit_options(hp_df, sizing_h, sizing_c, max_units)
         if hp_multi is None:
             return None, {"bldg_id": building_id, "peak_load_btu_hr": abs_h, "outdoor_temp_f": round(abs_ht, 1)}
         hp_multi = build_cost_menu(hp_multi, sqft, has_ducts)
@@ -359,6 +359,14 @@ def process_building(building_id, hp_base, metadata_df, consumption_dir):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def get_sizing_settings(cfg):
+    hp_cfg = cfg.get("heatpump") or {}
+    missing = [k for k in ("sizing_percentile", "max_units") if hp_cfg.get(k) is None]
+    if missing:
+        raise KeyError(f"config.yaml is missing heatpump.{', heatpump.'.join(missing)}")
+    return float(hp_cfg["sizing_percentile"]), int(hp_cfg["max_units"])
+
+
 def run_heatpump_selection(cfg):
     input_dir = cfg["paths"]["input_dir"]
     output_dir = cfg["paths"]["output_dir"]
@@ -366,6 +374,8 @@ def run_heatpump_selection(cfg):
     release_year = cfg["resstock"]["release_year"]
 
     hp_cfg = cfg.get("heatpump", {})
+    percentile, max_units = get_sizing_settings(cfg)
+    log.info(f"Sizing: {percentile:g}th percentile of nonzero load, up to {max_units} units")
     neep_path = hp_cfg.get("neep_database")
     if neep_path:
         neep_path = Path(neep_path)
@@ -413,7 +423,8 @@ def run_heatpump_selection(cfg):
     skipped = 0
 
     for i, bldg_id in enumerate(building_ids, 1):
-        metrics, zero = process_building(bldg_id, hp_base, metadata_df, consumption_dir)
+        metrics, zero = process_building(bldg_id, hp_base, metadata_df, consumption_dir,
+                                         percentile, max_units)
         if metrics is not None:
             summary_rows.append(metrics)
             processed += 1

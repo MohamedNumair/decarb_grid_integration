@@ -1,4 +1,3 @@
-import os
 from datetime import datetime
 from pathlib import Path
 
@@ -36,9 +35,6 @@ def load_config(config_path=None):
         if not p.is_absolute():
             p = config_dir / p
         cfg["paths"][key] = p
-
-    if cfg["api_keys"].get("nrel") is None:
-        cfg["api_keys"]["nrel"] = os.environ.get("NREL_API_KEY")
 
     _config = cfg
     return cfg

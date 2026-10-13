@@ -18,6 +18,8 @@ from config.loader import load_config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+SMARTDS_PROFILES_URL = "https://oedi-data-lake.s3.amazonaws.com/SMART-DS/v0.9/2018/Full_Texas/profiles/"
+MAX_WORKERS = 2
 
 def _s3_prefix(cfg):
     rs = cfg["resstock"]
@@ -145,6 +147,8 @@ def download_metadata(cfg):
     output_dir = cfg["paths"]["input_dir"]
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # The parquet is what every pipeline stage reads; the csv.gz is only
+    # downloaded for visually checking the metadata by hand.
     files = {
         "csv": f"{state}_upgrade0.csv.gz",
         "parquet": f"{state}_upgrade0.parquet",
@@ -162,11 +166,13 @@ def download_metadata(cfg):
             s3.download_file(bucket, key, str(local_path))
             log.info(f"Saved to {local_path}")
         except Exception as e:
-            log.error(f"Failed to download {filename}: {e}")
-
-
-SMARTDS_PROFILES_URL = "https://oedi-data-lake.s3.amazonaws.com/SMART-DS/v0.9/2018/Full_Texas/profiles/"
-KVAR_MAX_WORKERS = 2
+            if fmt == "parquet":
+                rs = cfg["resstock"]
+                raise RuntimeError(
+                    f"Failed to download ResStock metadata s3://{bucket}/{key}: {e}\n"
+                    f"Check state ({state!r}), resstock.release ({rs['release']!r}) and "
+                    f"resstock.release_year ({rs['release_year']!r}) in config.yaml.") from e
+            log.warning(f"Failed to download {filename} (only used for manual checks): {e}")
 
 
 def _collect_profile_filenames(opendss_dir):
@@ -199,7 +205,18 @@ def _download_profile(filename, output_dir, max_retries=5):
     return "failed"
 
 
-def download_network_profiles(cfg, kvar_only=True):
+def network_profiles_enabled(cfg):
+    matching = cfg.get("matching", {})
+    if "download_network_profiles" in matching:
+        return bool(matching["download_network_profiles"])
+    if "download_kvar" in matching:
+        log.warning("config key 'matching.download_kvar' is deprecated; "
+                    "rename it to 'matching.download_network_profiles'")
+        return bool(matching["download_kvar"])
+    return False
+
+
+def download_network_profiles(cfg, kvar_only=False):
     network_dir = cfg["paths"]["network_dir"]
 
     zone_dirs = sorted(
@@ -232,7 +249,7 @@ def download_network_profiles(cfg, kvar_only=True):
         failed = 0
         skipped = 0
 
-        with ThreadPoolExecutor(max_workers=KVAR_MAX_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
                 executor.submit(_download_profile, fn, profiles_dir): fn
                 for fn in to_download
@@ -256,5 +273,5 @@ if __name__ == "__main__":
     download_metadata(cfg)
     ids = get_valid_building_ids(cfg)
     download_building_files(cfg, ids)
-    if cfg.get("matching", {}).get("download_kvar", False):
-        download_network_profiles(cfg, kvar_only=True)
+    if network_profiles_enabled(cfg):
+        download_network_profiles(cfg)

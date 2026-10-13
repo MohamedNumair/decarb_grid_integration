@@ -36,10 +36,9 @@ This runs (in order):
 1. Data acquisition (ResStock downloads from OEDI)
 2. Thermal model fitting
 3. Feeder/network processing
-4. PV detection
-5. Building-to-load matching
-6. Schedule/setpoint generation
-7. Heat pump selection (NEEP database matching)
+4. Building-to-load matching
+5. Schedule/setpoint generation
+6. Heat pump selection (NEEP database matching)
 
 Toggle individual stages on/off in `config.yaml` under `stages:`. Use `test_mode: true` to limit to a small subset of buildings during development.
 

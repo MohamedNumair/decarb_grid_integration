@@ -8,6 +8,7 @@ from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from config.loader import load_config
+from fit_thermal_model import thermal_coeff_csv_path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -16,11 +17,9 @@ COUNTY_TAG = "in.county"
 CLIMATE_TAG = "in.building_america_climate_zone"
 SUMMER_DEMAND_TAG = "out.qoi.electricity.maximum_daily_peak_summer..kw"
 WINTER_DEMAND_TAG = "out.qoi.electricity.maximum_daily_peak_winter..kw"
-PV_TAG = "in.has_pv"
 
 F_STAT_THRESHOLD = 30
 COEFF_OUTLIER_FACTOR = 10      # exclude if any k is >10× or <1/10× the median
-DEFAULT_USAGE_LIMIT = 1        # each building matched at most once (unique matching)
 
 
 def read_parquet(path):
@@ -32,7 +31,6 @@ def read_parquet(path):
 
 def load_eligible_buildings(cfg):
     input_dir = cfg["paths"]["input_dir"]
-    output_dir = cfg["paths"]["output_dir"]
     state = cfg["state"]
 
     metadata_path = input_dir / f"{state}_upgrade0.parquet"
@@ -44,14 +42,18 @@ def load_eligible_buildings(cfg):
     total_buildings = len(nrel_df)
     log.info(f"Loaded {total_buildings} buildings from metadata")
 
-    thermal_results_dir = output_dir / "thermal_model_outputs" / state / "baseline_internal_gains"
-    thermal_csv = thermal_results_dir / "regression_coeff_baseline_internal_gains.csv"
+    thermal_csv = thermal_coeff_csv_path(cfg)
 
     if not thermal_csv.exists():
-        log.warning(f"No thermal model results found at {thermal_csv}, skipping f_stat filter")
-        return nrel_df
+        raise FileNotFoundError(
+            f"No thermal model results at {thermal_csv}. Run the thermal model "
+            f"stage first (stages.thermal_model: true in config.yaml).")
 
     thermal_df = pd.read_csv(str(thermal_csv))
+    if thermal_df.empty:
+        raise ValueError(
+            f"Thermal model results at {thermal_csv} contain no buildings. "
+            f"Check the thermal model stage log for why no fits succeeded.")
     thermal_df["bldg_id"] = thermal_df["bldg_id"].astype(int)
 
     # --- F-stat filter ---
@@ -88,6 +90,12 @@ def load_eligible_buildings(cfg):
 
     eligible_df = nrel_df[nrel_df["bldg_id"].isin(eligible_ids)].copy()
     log.info(f"Eligible buildings after filter: {len(eligible_df)} / {total_buildings}")
+    if eligible_df.empty:
+        raise ValueError(
+            f"No buildings left to match: {len(thermal_df)} fitted, {len(fstat_pass)} "
+            f"passed f_stat >= {F_STAT_THRESHOLD}, {n_outliers} removed as coefficient "
+            f"outliers, {len(eligible_ids)} remaining, 0 of those found in "
+            f"{metadata_path.name}. Check the thermal model results at {thermal_csv}.")
 
     # In test mode, limit the building pool (not the buses)
     if cfg.get("test_mode") and cfg.get("test_limit"):
@@ -111,10 +119,22 @@ def load_feeder_summaries(cfg):
     # Filter to configured zone (all buses in that zone)
     zone_name = cfg.get("zone", {}).get("name")
     if zone_name and "zone" in feeder_df.columns:
+        available = sorted(feeder_df["zone"].dropna().unique())
+        if zone_name not in available:
+            shown = ", ".join(available[:20]) + (f", ... ({len(available)} total)"
+                                                 if len(available) > 20 else "")
+            raise ValueError(
+                f"Zone {zone_name!r} (zone.name in config.yaml) does not exist in "
+                f"{feeder_path}. Zones available: {shown or 'none'}. Check the zone "
+                f"name, or re-run feeder processing if the zone is missing.")
         feeder_df = feeder_df[feeder_df["zone"] == zone_name].copy()
         log.info(f"Loaded {len(feeder_df)} buses in zone {zone_name}")
     else:
         log.info(f"Loaded {len(feeder_df)} feeder buses (all zones)")
+
+    if feeder_df.empty:
+        raise ValueError(f"No feeder buses to match in {feeder_path}. "
+                         f"Re-run feeder processing.")
 
     return feeder_df
 
@@ -375,132 +395,55 @@ def match_climate(feeder_df, nrel_df, valid_df, usage_limit,
     return feeder_df, valid_df
 
 
-def load_pv_load_ids(cfg):
-    pv_csv = cfg.get("matching", {}).get("pv_profiles_csv")
-    if pv_csv is None:
-        pv_csv = cfg["paths"]["input_dir"] / "potential_pv_rooftops.csv"
-    else:
-        pv_csv = Path(pv_csv)
-
-    if not pv_csv.exists():
-        log.warning(f"No rooftop PV profile list at {pv_csv}, treating all buses as non-PV")
-        return set()
-
-    pv_df = pd.read_csv(str(pv_csv))
-    log.info(f"Loaded {len(pv_df)} rooftop PV candidate loads from {pv_csv}")
-    return set(pv_df["load_id"])
-
-
-def tag_rooftop_pv(feeder_df, pv_load_ids):
-    feeder_df = feeder_df.copy()
-    load_id = feeder_df["yearly"].str.extract(r"^res_kw_(.+)_pu$")[0]
-    feeder_df["has_rooftop_pv"] = load_id.isin(pv_load_ids)
-    n_pv = feeder_df["has_rooftop_pv"].sum()
-    log.info(f"Tagged {n_pv}/{len(feeder_df)} buses as rooftop PV")
-    return feeder_df
-
-
-def match_pv_statewide(pv_feeder_df, pv_eligible_df, summer_tag, winter_tag):
-    pv_eligible_df = pv_eligible_df.copy()
-    pv_eligible_df["max_demand_kw"] = pv_eligible_df[[summer_tag, winter_tag]].max(axis=1)
-
-    results = []
-    for kw in pv_feeder_df["kw"]:
-        if pd.isna(kw):
-            results.append((None, None, None))
-            continue
-        diffs = np.abs(pv_eligible_df["max_demand_kw"].values - kw)
-        best = pv_eligible_df.iloc[diffs.argmin()]
-        results.append((best["bldg_id"], best[summer_tag], best[winter_tag]))
-
-    results = np.array(results, dtype=object)
-    pv_feeder_df = pv_feeder_df.copy()
-    pv_feeder_df["nrel_county_match"] = results[:, 0]
-    pv_feeder_df["nrel_county_summer_kw"] = results[:, 1]
-    pv_feeder_df["nrel_county_winter_kw"] = results[:, 2]
-    pv_feeder_df["nrel_climate_match"] = results[:, 0]
-    pv_feeder_df["nrel_climate_summer_kw"] = results[:, 1]
-    pv_feeder_df["nrel_climate_winter_kw"] = results[:, 2]
-
-    matched = pv_feeder_df["nrel_county_match"].notna().sum()
-    log.info(f"PV statewide match: {matched}/{len(pv_feeder_df)} PV buses matched")
-    return pv_feeder_df
-
-
 def run_matching(cfg):
     input_dir = cfg["paths"]["input_dir"]
-    pv_rooftop = cfg.get("matching", {}).get("pv_rooftop", False)
 
     eligible_df = load_eligible_buildings(cfg)
     feeder_df = load_feeder_summaries(cfg)
 
-    # Compute usage_limit: "auto" = ceil(n_buses / n_buildings) + 1 headroom
-    usage_limit_cfg = cfg.get("matching", {}).get("usage_limit", DEFAULT_USAGE_LIMIT)
+    # Compute usage_limit: "auto" = ceil(usage_multiplier × n_buses / n_buildings)
+    matching_cfg = cfg.get("matching") or {}
+    usage_limit_cfg = matching_cfg.get("usage_limit")
+    if usage_limit_cfg is None:
+        raise KeyError("config.yaml is missing matching.usage_limit "
+                       "(an integer, or \"auto\" with matching.usage_multiplier)")
+    if usage_limit_cfg != "auto" and not (
+            isinstance(usage_limit_cfg, int) and not isinstance(usage_limit_cfg, bool)
+            and usage_limit_cfg >= 1):
+        raise ValueError(f"matching.usage_limit must be \"auto\" or an integer >= 1, "
+                         f"got {usage_limit_cfg!r}")
     if usage_limit_cfg == "auto":
         import math
+        multiplier = matching_cfg.get("usage_multiplier")
+        if multiplier is None:
+            raise KeyError("config.yaml is missing matching.usage_multiplier "
+                           "(required when matching.usage_limit is 'auto')")
         n_buses = len(feeder_df)
         n_buildings = len(eligible_df)
-        usage_limit = math.ceil(15 * n_buses / n_buildings)
+        usage_limit = math.ceil(multiplier * n_buses / n_buildings)
         log.info(f"Match diversity: usage_limit=auto → {usage_limit} "
-                 f"(ceil(15 × {n_buses}/{n_buildings}))")
+                 f"(ceil({multiplier:g} × {n_buses}/{n_buildings}))")
     else:
-        usage_limit = int(usage_limit_cfg)
+        usage_limit = usage_limit_cfg
         log.info(f"Match diversity: usage_limit={usage_limit}")
 
     if "kw" not in feeder_df.columns:
         log.error("Feeder summaries missing 'kw' column — cannot match by demand")
         return None
 
-    if pv_rooftop:
-        pv_load_ids = load_pv_load_ids(cfg)
-        feeder_df = tag_rooftop_pv(feeder_df, pv_load_ids)
+    feeder_df = match_county(
+        feeder_df, eligible_df,
+        COUNTY_TAG, SUMMER_DEMAND_TAG, WINTER_DEMAND_TAG,
+    )
 
-        pv_mask = feeder_df["has_rooftop_pv"]
-        pv_subset = feeder_df[pv_mask]
-        non_pv_subset = feeder_df[~pv_mask]
+    valid_df = eligible_df.copy()
+    if "bldg_id" not in valid_df.columns:
+        valid_df = valid_df.reset_index().rename(columns={"index": "bldg_id"})
 
-        pv_eligible = eligible_df[eligible_df[PV_TAG] == "Yes"]
-        non_pv_eligible = eligible_df[eligible_df[PV_TAG] != "Yes"]
-
-        log.info(
-            f"PV split: {len(pv_subset)} PV buses -> {len(pv_eligible)} PV buildings | "
-            f"{len(non_pv_subset)} non-PV buses -> {len(non_pv_eligible)} non-PV buildings"
-        )
-
-        matched_pv = match_pv_statewide(
-            pv_subset, pv_eligible, SUMMER_DEMAND_TAG, WINTER_DEMAND_TAG,
-        )
-
-        non_pv_subset = match_county(
-            non_pv_subset, non_pv_eligible,
-            COUNTY_TAG, SUMMER_DEMAND_TAG, WINTER_DEMAND_TAG,
-        )
-        valid_df = non_pv_eligible.copy()
-        if "bldg_id" not in valid_df.columns:
-            valid_df = valid_df.reset_index().rename(columns={"index": "bldg_id"})
-
-        non_pv_subset, valid_df = match_climate(
-            non_pv_subset, non_pv_eligible, valid_df, usage_limit,
-            COUNTY_TAG, CLIMATE_TAG, SUMMER_DEMAND_TAG, WINTER_DEMAND_TAG,
-        )
-
-        feeder_df = pd.concat([matched_pv, non_pv_subset]).sort_index()
-    else:
-        feeder_df["has_rooftop_pv"] = False
-
-        feeder_df = match_county(
-            feeder_df, eligible_df,
-            COUNTY_TAG, SUMMER_DEMAND_TAG, WINTER_DEMAND_TAG,
-        )
-
-        valid_df = eligible_df.copy()
-        if "bldg_id" not in valid_df.columns:
-            valid_df = valid_df.reset_index().rename(columns={"index": "bldg_id"})
-
-        feeder_df, valid_df = match_climate(
-            feeder_df, eligible_df, valid_df, usage_limit,
-            COUNTY_TAG, CLIMATE_TAG, SUMMER_DEMAND_TAG, WINTER_DEMAND_TAG,
-        )
+    feeder_df, valid_df = match_climate(
+        feeder_df, eligible_df, valid_df, usage_limit,
+        COUNTY_TAG, CLIMATE_TAG, SUMMER_DEMAND_TAG, WINTER_DEMAND_TAG,
+    )
 
     output_path = input_dir / "feeder_summaries_matched.parquet"
     feeder_df.to_parquet(str(output_path), index=False)
@@ -509,7 +452,6 @@ def run_matching(cfg):
     summary_path = input_dir / "matching_summary.csv"
     agg_dict = {
         "total_buses": ("Name", "count"),
-        "pv_buses": ("has_rooftop_pv", "sum"),
         "county_matched": ("nrel_county_match", lambda x: x.notna().sum()),
         "climate_matched": ("nrel_climate_match", lambda x: x.notna().sum()),
         "unique_bldgs_matched": ("nrel_climate_match", "nunique"),
