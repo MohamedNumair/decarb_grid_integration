@@ -6,7 +6,9 @@
 # ============================================================
 
 # --- Date Range ---
-# Controls the simulation period.  Dates are "Mon DD" strings.
+# Simulation period for the DECARB inputs (tm.csv) and the network inputs
+# built from DECARB results. Preprocessing always uses the full year.
+# Dates are "Mon DD" strings.
 # If start is AFTER end the window wraps around the new year
 # (e.g. start: "Dec 1", end: "Feb 28" → Dec + Jan + Feb).
 date_range:
@@ -23,16 +25,16 @@ scope: "zone"
 
 # --- Zone Settings (only used when scope = "zone") ---
 zone:
-  name: "P100U"               # zone to analyze
+  name: "P101U"               # zone to analyze
 
 # --- Test Mode ---
 # When true, limits downloads and processing to a small subset
-test_mode: false
+test_mode: true
 test_limit: 600              # max buildings in the candidate pool (ignored when test_mode=false)
 
 # --- State & Geography ---
-state: "MA"
-state_full: "Massachusetts"
+state: "NY"
+state_full: "New York"
 year: 2018
 timezone: "America/New_York"  # IANA time zone of the buildings' timestamps; used for the
                               # solar position when sizing rooftop PV orientation
@@ -43,7 +45,7 @@ paths:
   project_root: ".."
   input_dir: "../in"
   output_dir: "../out"
-  network_dir: "D:/full_texas"
+  network_dir: "D:/smartds"
   county_shapefile: "../in/us_county_boundaries/us-county-boundaries.shp"
 
 # --- ResStock / OEDI Data ---
@@ -52,9 +54,20 @@ resstock:
   release_year: 2025
   s3_bucket: "oedi-data-lake"
 
-# --- Matching Flags ---
+# --- SMART-DS distribution network (public OEDI bucket) ---
+smartds:
+  s3_bucket: "oedi-data-lake"
+  s3_prefix: "SMART-DS/v0.9/2018/Full_Texas"
+
+# --- Data Acquisition (only used when stages.data_acquisition: true) ---
+data_acquisition:
+  download_network: true            # download the SMART-DS feeder .dss files for the zone(s)
+                                    # into paths.network_dir (files already there are skipped)
+  download_network_profiles: false  # download the SMART-DS kw + kvar loadshape profiles referenced
+                                    # by the feeders; not used by the OpenDSS cases network-inputs builds
+
+# --- Matching ---
 matching:
-  download_network_profiles: false  # download missing SMART-DS kw + kvar loadshape profiles referenced by the feeders (required by OpenDSS)
   usage_limit: auto            # max times a building can be matched (integer, or "auto" — see usage_multiplier)
   usage_multiplier: 15         # used when usage_limit = "auto":
                                #   usage_limit = ceil(usage_multiplier × n_buses / n_buildings)
@@ -75,12 +88,12 @@ schedules:
 
 # --- Pipeline Stage Toggles ---
 stages:
-  data_acquisition: false      # already done
-  thermal_model: false         # already done
-  feeder_processing: false
-  building_matching: false
-  schedules: false
-  heatpump_selection: false
+  data_acquisition: true
+  thermal_model: true
+  feeder_processing: true
+  building_matching: true
+  schedules: true
+  heatpump_selection: true
 
 # --- Heat Pump Selection ---
 heatpump:

@@ -18,7 +18,6 @@ from config.loader import load_config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-SMARTDS_PROFILES_URL = "https://oedi-data-lake.s3.amazonaws.com/SMART-DS/v0.9/2018/Full_Texas/profiles/"
 MAX_WORKERS = 2
 
 def _s3_prefix(cfg):
@@ -206,8 +205,16 @@ def _collect_profile_filenames(opendss_dir):
     return filenames
 
 
-def _download_profile(filename, output_dir, max_retries=5):
-    url = SMARTDS_PROFILES_URL + filename
+def _smartds_location(cfg):
+    sm = cfg.get("smartds") or {}
+    missing = [k for k in ("s3_bucket", "s3_prefix") if not sm.get(k)]
+    if missing:
+        raise KeyError(f"config.yaml is missing smartds.{', smartds.'.join(missing)}")
+    return sm["s3_bucket"], sm["s3_prefix"].strip("/")
+
+
+def _download_profile(filename, output_dir, base_url, max_retries=5):
+    url = base_url + filename
     out = os.path.join(str(output_dir), filename)
     if os.path.exists(out):
         return "skipped"
@@ -226,26 +233,139 @@ def _download_profile(filename, output_dir, max_retries=5):
 
 
 def network_profiles_enabled(cfg):
-    matching = cfg.get("matching", {})
-    if "download_network_profiles" in matching:
-        return bool(matching["download_network_profiles"])
-    if "download_kvar" in matching:
-        log.warning("config key 'matching.download_kvar' is deprecated; "
-                    "rename it to 'matching.download_network_profiles'")
-        return bool(matching["download_kvar"])
+    acq = cfg.get("data_acquisition") or {}
+    if "download_network_profiles" in acq:
+        return bool(acq["download_network_profiles"])
+    matching = cfg.get("matching") or {}
+    for old_key in ("download_network_profiles", "download_kvar"):
+        if old_key in matching:
+            log.warning(f"config key 'matching.{old_key}' is deprecated; move it to "
+                        f"'data_acquisition.download_network_profiles'")
+            return bool(matching[old_key])
     return False
+
+
+def network_download_enabled(cfg):
+    return bool((cfg.get("data_acquisition") or {}).get("download_network", False))
+
+
+def _list_smartds_zones(s3, bucket, prefix):
+    from process_network_info import ZONE_PATTERN
+    zones, token = [], None
+    while True:
+        params = {"Bucket": bucket, "Prefix": f"{prefix}/", "Delimiter": "/"}
+        if token:
+            params["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**params)
+        for p in resp.get("CommonPrefixes", []):
+            name = p["Prefix"].rstrip("/").split("/")[-1]
+            if ZONE_PATTERN.match(name):
+                zones.append(name)
+        token = resp.get("NextContinuationToken")
+        if not token:
+            return sorted(zones)
+
+
+def _list_keys(s3, bucket, prefix):
+    keys, token = [], None
+    while True:
+        params = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            params["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**params)
+        keys += [o["Key"] for o in resp.get("Contents", [])]
+        token = resp.get("NextContinuationToken")
+        if not token:
+            return keys
+
+
+def download_network(cfg):
+    """Download the SMART-DS feeder .dss files (the zone's opendss/ folder)
+    into paths.network_dir, keeping the bucket layout. Existing files are
+    skipped. scope: zone -> zone.name only; statewide -> every zone."""
+    from process_network_info import select_zones
+
+    s3 = _s3_client()
+    bucket, prefix = _smartds_location(cfg)
+    network_dir = Path(cfg["paths"]["network_dir"])
+
+    available = _list_smartds_zones(s3, bucket, prefix)
+    if not available:
+        raise RuntimeError(f"No SMART-DS zones found at s3://{bucket}/{prefix}/ "
+                           f"(check smartds in config.yaml)")
+
+    if cfg.get("scope") == "zone":
+        zone_name = cfg["zone"]["name"]
+        if zone_name not in available:
+            raise ValueError(
+                f"Zone {zone_name!r} (zone.name in config.yaml) is not in SMART-DS at "
+                f"s3://{bucket}/{prefix}/. Available: {', '.join(available[:20])}"
+                + (f", ... ({len(available)} total)" if len(available) > 20 else ""))
+        zones = [zone_name]
+    else:
+        zones = [d.name for d in select_zones(cfg, [network_dir / z for z in available])]
+        if len(zones) > 10:
+            log.warning(f"Downloading the network for {len(zones)} zones "
+                        f"(roughly 25 MB each)")
+
+    failed = []
+    for zone in zones:
+        zone_prefix = f"{prefix}/{zone}/scenarios/base_timeseries/opendss/"
+        keys = [k for k in _list_keys(s3, bucket, zone_prefix) if not k.endswith("/")]
+        if not keys:
+            raise RuntimeError(f"No network files found at s3://{bucket}/{zone_prefix}")
+
+        def _fetch(key):
+            # download_file writes to a temporary name and renames it when
+            # complete, so an interrupted download never leaves a partial file
+            local = network_dir / key[len(prefix) + 1:]
+            if local.exists():
+                return "skipped"
+            local.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                s3.download_file(bucket, key, str(local))
+                return "downloaded"
+            except Exception as e:
+                return f"failed: {e}"
+
+        counts = {"downloaded": 0, "skipped": 0}
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch, k): k for k in keys}
+            for future in as_completed(futures):
+                result = future.result()
+                if result in counts:
+                    counts[result] += 1
+                else:
+                    failed.append((futures[future], result))
+        log.info(f"Network {zone}: {counts['downloaded']} downloaded, "
+                 f"{counts['skipped']} already present, "
+                 f"{len(keys) - sum(counts.values())} failed "
+                 f"-> {network_dir / zone}")
+
+    if failed:
+        examples = "\n".join(f"  {k}: {r}" for k, r in failed[:10])
+        hint = ""
+        longest = max(len(str(network_dir / k[len(prefix) + 1:])) for k, _ in failed)
+        if os.name == "nt" and longest > 220:
+            hint = (f"\nThe local paths are up to {longest} characters; Windows limits paths "
+                    f"to 260 by default. Use a shorter paths.network_dir (e.g. D:/smartds) "
+                    f"or enable Windows long path support.")
+        raise RuntimeError(f"{len(failed)} network file(s) failed to download:\n{examples}\n"
+                           f"Re-run data acquisition to retry; finished files are skipped.{hint}")
 
 
 def download_network_profiles(cfg, kvar_only=False):
     network_dir = cfg["paths"]["network_dir"]
+    bucket, prefix = _smartds_location(cfg)
+    base_url = f"https://{bucket}.s3.amazonaws.com/{prefix}/profiles/"
 
     zone_dirs = sorted(
         d for d in Path(network_dir).iterdir()
         if d.is_dir()
     )
 
-    from process_network_info import select_test_zones
-    zone_dirs = select_test_zones(cfg, zone_dirs)
+    from process_network_info import select_zones
+    zone_dirs = select_zones(cfg, zone_dirs)
 
     for zone_dir in zone_dirs:
         opendss_dir = zone_dir / "scenarios" / "base_timeseries" / "opendss"
@@ -270,7 +390,7 @@ def download_network_profiles(cfg, kvar_only=False):
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
-                executor.submit(_download_profile, fn, profiles_dir): fn
+                executor.submit(_download_profile, fn, profiles_dir, base_url): fn
                 for fn in to_download
             }
             for future in as_completed(futures):
@@ -292,5 +412,7 @@ if __name__ == "__main__":
     download_metadata(cfg)
     ids = get_valid_building_ids(cfg)
     download_building_files(cfg, ids)
+    if network_download_enabled(cfg):
+        download_network(cfg)
     if network_profiles_enabled(cfg):
         download_network_profiles(cfg)

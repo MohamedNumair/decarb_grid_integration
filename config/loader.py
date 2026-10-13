@@ -139,3 +139,12 @@ def resolve_hour_indices(cfg):
     if len(indices) == 8760:
         return None
     return indices
+
+
+def resolve_step_indices(cfg, steps_per_hour):
+    """Like resolve_hour_indices, but indices into a year of steps_per_hour
+    steps per hour (4 for 15-min data). Returns None for the full year."""
+    hours = resolve_hour_indices(cfg)
+    if hours is None:
+        return None
+    return (hours[:, None] * steps_per_hour + np.arange(steps_per_hour)).ravel()

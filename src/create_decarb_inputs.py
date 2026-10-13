@@ -16,7 +16,7 @@ import pvlib
 import requests
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from config.loader import load_config, load_decarb_config, resolve_hour_indices
+from config.loader import load_config, load_decarb_config, resolve_step_indices
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -303,6 +303,13 @@ def compute_optimal_orientation(lat, lon, alt, tz, tm_df):
 # File generators
 # ---------------------------------------------------------------------------
 
+def us_dst_start(year):
+    """Start of US daylight saving time: 2:00 on the second Sunday of March."""
+    march1 = datetime(year, 3, 1, 2, 0)
+    first_sunday = 1 + (6 - march1.weekday()) % 7
+    return march1.replace(day=first_sunday + 7)
+
+
 def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
                      tariff, dcfg):
     timestep = dcfg["timestep"]
@@ -321,7 +328,7 @@ def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
 
     timestamps = pd.date_range(
         start=datetime(year, 1, 1, 0, 0), periods=n_steps, freq=freq)
-    dst_spring = datetime(year, 3, 11, 2, 0)
+    dst_spring = us_dst_start(year)
     if dst_spring in timestamps:
         mask = timestamps >= dst_spring
         timestamps = pd.DatetimeIndex([
@@ -574,9 +581,10 @@ def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
     else:
         df["pBppl"] = 0
 
-    hour_indices = resolve_hour_indices(_worker_state["cfg"])
-    if hour_indices is not None:
-        df = df.iloc[hour_indices]
+    steps_per_hour = 1 if timestep == "hourly" else 4
+    step_indices = resolve_step_indices(_worker_state["cfg"], steps_per_hour)
+    if step_indices is not None:
+        df = df.iloc[step_indices]
 
     return df
 
@@ -634,15 +642,31 @@ def create_bdg_i_file(output_dir, template, building_row,
     df.to_csv(str(output_dir / "bdg_i.csv"), header=False)
 
 
-def create_bdg_ii_file(output_dir, bldg_id, regression_coeffs):
+TIMESTEP_FIT_STEPS = {"15min": 1, "hourly": 4}   # DECARB step length in thermal-fit steps
+
+
+def convert_thermal_coeffs(k1, k2, k3, n_steps):
+    """Thermal model coefficients fitted on 15-min steps, converted to a step
+    n_steps times as long (4 for hourly), by applying the 15-min model n_steps
+    times with the inputs held constant over the longer step."""
+    if n_steps == 1:
+        return k1, k2, k3
+    k1_n = 1 - (1 - k1) ** n_steps
+    gain = k1_n / k1 if k1 > 0 else n_steps   # limit of k1_n / k1 as k1 -> 0
+    return k1_n, k2 * gain, k3 * gain
+
+
+def create_bdg_ii_file(output_dir, bldg_id, regression_coeffs, timestep):
     key = str(bldg_id)
     if key not in regression_coeffs:
         raise KeyError(f"Building {bldg_id} not found in the thermal model results")
     coeffs = regression_coeffs[key]
+    k1, k2, k3 = convert_thermal_coeffs(
+        coeffs["k1"], coeffs["k2"], coeffs["k3"], TIMESTEP_FIT_STEPS[timestep])
     pd.DataFrame([{
-        "pBk1": coeffs["k1"],
-        "pBk2": coeffs["k2"] * 1000,
-        "pBk3": coeffs["k3"] * 1000,
+        "pBk1": k1,
+        "pBk2": k2 * 1000,
+        "pBk3": k3 * 1000,
     }]).to_csv(str(output_dir / "bdg_ii.csv"), index=False)
 
 
@@ -1064,7 +1088,7 @@ def process_building(args):
             create_tm_file(tm_df, output_dir)
 
         if outputs["bdg_ii"]:
-            create_bdg_ii_file(output_dir, bldg_id, regression_coeffs)
+            create_bdg_ii_file(output_dir, bldg_id, regression_coeffs, dcfg["timestep"])
 
         if outputs["in"]:
             create_in_file(output_dir, templates["in"], consumption_df)
@@ -1288,6 +1312,11 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
     year = cfg["year"]
     outputs = dcfg["outputs"]
 
+    timestep = dcfg.get("timestep")
+    if timestep not in TIMESTEP_FIT_STEPS:
+        raise ValueError(f"timestep in decarb.yaml must be one of "
+                         f"{', '.join(TIMESTEP_FIT_STEPS)}, got {timestep!r}")
+
     # Check thermal model results before creating a study directory
     from fit_thermal_model import thermal_coeff_csv_path
     coeff_csv = thermal_coeff_csv_path(cfg)
@@ -1296,6 +1325,13 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
             f"No thermal model results at {coeff_csv}. Run the thermal model stage "
             f"first (stages.thermal_model: true in config.yaml), or set "
             f"outputs.bdg_ii: false in decarb.yaml.")
+
+    if outputs["bdg_ii"]:
+        if TIMESTEP_FIT_STEPS[timestep] == 1:
+            log.info("bdg_ii: thermal coefficients written as fitted (15-min steps)")
+        else:
+            log.info(f"bdg_ii: 15-min thermal coefficients converted to {timestep} "
+                     f"steps ({TIMESTEP_FIT_STEPS[timestep]} fit steps per DECARB step)")
 
     if dcfg.get("rooftop_solar", {}).get("enabled", False):
         tz = cfg.get("timezone")
@@ -1322,6 +1358,16 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
         matching_file = study_dir / "feeder_summaries_matched.parquet"
     if matching_file.exists():
         matched_df = read_parquet(matching_file)
+        if cfg.get("scope") == "zone" and "zone" in matched_df.columns:
+            file_zones = sorted(matched_df["zone"].dropna().unique())
+            zone_name = cfg["zone"]["name"]
+            if file_zones != [zone_name]:
+                fix = ("Re-run building matching (stages.building_matching: true)"
+                       if matching_file == matching_src else
+                       "Use a study made for this zone, or change zone.name")
+                raise ValueError(
+                    f"{matching_file} is for zone(s) {', '.join(file_zones) or 'none'}, "
+                    f"but zone.name in config.yaml is {zone_name!r}. {fix}.")
         bldg_col = "nrel_climate_match" if "nrel_climate_match" in matched_df.columns else "nrel_county_match"
         building_ids = (matched_df[bldg_col].dropna().astype(int)
                         .unique().tolist())

@@ -28,10 +28,9 @@ genx:
   max_curtailment: 1
   cost_mwh: 2000
 
-# --- OpenDSS Settings (used when scope = "zone") ---
-opendss:
-  period: "yearly"              # "daily", "monthly", "yearly"
-  resolution: "15min"           # simulation timestep
+# --- OpenDSS (scope = "zone") ---
+# No settings here: OpenDSS cases use the DECARB timestep of the study
+# (decarb.yaml -> timestep) and date_range from config.yaml.
 
 # --- Interpolation ---
 # When enabled, interpolate_demand.py computes intermediate electrification

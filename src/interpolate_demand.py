@@ -26,11 +26,16 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from config.loader import load_config, load_network_config
+from config.loader import (load_config, load_network_config,
+                           resolve_hour_indices, resolve_step_indices)
 
 from create_network_inputs import (
+    HOURS_PER_YEAR,
+    STEPS_PER_HOUR,
     build_substitution_map,
     read_decarb_ts,
+    select_period,
+    study_timestep,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -43,8 +48,6 @@ HEATING_FUEL_COL = "in.heating_fuel"
 HEATING_FUEL_ELEC_VAL = "Electricity"
 HAS_PV_COL = "in.has_pv"
 HAS_PV_VAL = "Yes"
-
-HOUR_ZERO = pd.Timestamp("2018-01-01 00:00")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,41 +163,48 @@ def build_adoption_batches(non_adopted_ids, instance_counts, total_instances,
 # Profile loading and aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_net_profiles(decarb_case_dir, building_ids, sub_map=None):
-    """Load net-kW profiles (buy - sell) for all buildings from a DECARB case.
+def load_net_profiles(decarb_case_dir, building_ids, sub_map=None,
+                      step_indices=None, n_full_year=HOURS_PER_YEAR):
+    """Load net-kW profiles (buy - sell) for all buildings from a DECARB case,
+    cut to the date range (see select_period).
 
     This matches the OpenDSS loadshape definition:
         net_kw = buy - sell
     Positive = drawing from grid, negative = exporting to grid (solar).
 
-    Returns dict {bldg_id: net_kw_array (8760,)}.
+    Returns dict {bldg_id: net_kw_array (n_steps,)}.
     """
     if sub_map is None:
         sub_map = {}
     profiles = {}
     for bldg_id in building_ids:
         bldg_id = int(bldg_id)
+        source_id = bldg_id
         ts_df = read_decarb_ts(decarb_case_dir, bldg_id)
         if ts_df is None or "buy" not in ts_df.columns:
             if bldg_id in sub_map:
-                ts_df = read_decarb_ts(decarb_case_dir, sub_map[bldg_id])
+                source_id = sub_map[bldg_id]
+                ts_df = read_decarb_ts(decarb_case_dir, source_id)
             if ts_df is None or "buy" not in ts_df.columns:
                 continue
-        buy = ts_df["buy"].values[:8760].astype(np.float64)
-        sell = ts_df["sell"].values[:8760].astype(np.float64) if "sell" in ts_df.columns else 0.0
-        profiles[bldg_id] = buy - sell
+        buy = ts_df["buy"].values.astype(np.float64)
+        sell = ts_df["sell"].values.astype(np.float64) if "sell" in ts_df.columns else 0.0
+        profiles[bldg_id] = select_period(
+            buy - sell, step_indices, n_full_year,
+            f"{decarb_case_dir.name}/{source_id} ts.csv")
     return profiles
 
 
 def aggregate_demand(instance_counts, profiles_base, profiles_full=None,
-                     switched_ids=None, n_hours=8760):
+                     switched_ids=None, n_steps=HOURS_PER_YEAR):
     """Aggregate demand using base + delta approach.
 
     1. Sum all buildings at their base (heat_0 / solar_0) profile
     2. For switched buildings, add (full - base) delta
 
-    Returns total_kw array (8760,).
+    Returns total_kw array (n_steps,).
     """
+    n_hours = n_steps
     total_kw = np.zeros(n_hours, dtype=np.float64)
 
     # Base aggregation
@@ -223,12 +233,23 @@ def aggregate_demand(instance_counts, profiles_base, profiles_full=None,
     return total_kw
 
 
-def summarize_demand(total_kw):
-    """Compute peak kW, peak datetime, and annual MWh from hourly kW array."""
+def step_times(cfg, timestep):
+    """Timestamp of every step in the simulated period (full year or
+    date_range), matching the order of the DECARB profiles."""
+    steps_per_hour = STEPS_PER_HOUR[timestep]
+    hours = resolve_hour_indices(cfg)
+    if hours is None:
+        hours = np.arange(HOURS_PER_YEAR)
+    offsets_h = (hours[:, None] + np.arange(steps_per_hour) / steps_per_hour).ravel()
+    return pd.Timestamp(f"{cfg['year']}-01-01") + pd.to_timedelta(offsets_h, unit="h")
+
+
+def summarize_demand(total_kw, times, step_hours=1.0):
+    """Peak kW, peak datetime, and energy (MWh) over the simulated period."""
     peak_idx = int(np.argmax(total_kw))
     peak_kw = float(total_kw[peak_idx])
-    peak_dt = HOUR_ZERO + pd.Timedelta(hours=peak_idx)
-    annual_mwh = float(np.sum(total_kw)) / 1000.0  # kWh -> MWh
+    peak_dt = times[peak_idx]
+    annual_mwh = float(np.sum(total_kw)) * step_hours / 1000.0  # kW x h -> kWh -> MWh
     return peak_kw, peak_dt, annual_mwh
 
 
@@ -255,6 +276,17 @@ def interpolate_study_demand(cfg, ncfg, study_dir, elec_levels=None,
     elec_levels and solar_levels are accepted for pipeline compatibility
     but ignored — the script auto-detects intermediate steps from metadata.
     """
+    # Time axis: the study's DECARB timestep, cut to date_range
+    timestep = study_timestep(study_dir)
+    steps_per_hour = STEPS_PER_HOUR[timestep]
+    step_hours = 1.0 / steps_per_hour
+    n_full_year = HOURS_PER_YEAR * steps_per_hour
+    step_indices = resolve_step_indices(cfg, steps_per_hour)
+    times = step_times(cfg, timestep)
+    n_steps = len(times)
+    log.info(f"Interpolating at {timestep} resolution, {n_steps} steps"
+             + (" (date_range)" if step_indices is not None else " (full year)"))
+
     # Load metadata
     metadata_df = load_metadata(cfg)
     log.info(f"Loaded metadata: {len(metadata_df)} buildings")
@@ -321,7 +353,8 @@ def interpolate_study_demand(cfg, ncfg, study_dir, elec_levels=None,
         if key not in profile_cache:
             sub_map = build_substitution_map(case_dir, all_bldg_ids, cfg)
             profile_cache[key] = load_net_profiles(
-                case_dir, all_bldg_ids, sub_map=sub_map)
+                case_dir, all_bldg_ids, sub_map=sub_map,
+                step_indices=step_indices, n_full_year=n_full_year)
             log.info(f"  Loaded {len(profile_cache[key])} net profiles from {case_dir.name}")
         return profile_cache[key]
 
@@ -346,8 +379,8 @@ def interpolate_study_demand(cfg, ncfg, study_dir, elec_levels=None,
             profiles_full = _load_profiles(full_dir)
 
             # Bookend: 0% (= baseline)
-            total_kw = aggregate_demand(instance_counts, profiles_base)
-            peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw)
+            total_kw = aggregate_demand(instance_counts, profiles_base, n_steps=n_steps)
+            peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw, times, step_hours)
             rows.append({
                 "tariff": tariff,
                 "dimension": "electrification",
@@ -364,8 +397,9 @@ def interpolate_study_demand(cfg, ncfg, study_dir, elec_levels=None,
             for pct in elec_steps:
                 switched = elec_batches[pct]
                 total_kw = aggregate_demand(
-                    instance_counts, profiles_base, profiles_full, switched)
-                peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw)
+                    instance_counts, profiles_base, profiles_full, switched,
+                    n_steps=n_steps)
+                peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw, times, step_hours)
                 rows.append({
                     "tariff": tariff,
                     "dimension": "electrification",
@@ -381,8 +415,8 @@ def interpolate_study_demand(cfg, ncfg, study_dir, elec_levels=None,
                          f"peak={peak_kw:.0f} kW @ {peak_dt}")
 
             # Bookend: 100%
-            total_kw = aggregate_demand(instance_counts, profiles_full)
-            peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw)
+            total_kw = aggregate_demand(instance_counts, profiles_full, n_steps=n_steps)
+            peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw, times, step_hours)
             rows.append({
                 "tariff": tariff,
                 "dimension": "electrification",
@@ -410,8 +444,8 @@ def interpolate_study_demand(cfg, ncfg, study_dir, elec_levels=None,
             profiles_full = _load_profiles(full_dir)
 
             # Bookend: 0% (= baseline)
-            total_kw = aggregate_demand(instance_counts, profiles_base)
-            peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw)
+            total_kw = aggregate_demand(instance_counts, profiles_base, n_steps=n_steps)
+            peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw, times, step_hours)
             rows.append({
                 "tariff": tariff,
                 "dimension": "pv_penetration",
@@ -428,8 +462,9 @@ def interpolate_study_demand(cfg, ncfg, study_dir, elec_levels=None,
             for pct in pv_steps:
                 switched = pv_batches[pct]
                 total_kw = aggregate_demand(
-                    instance_counts, profiles_base, profiles_full, switched)
-                peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw)
+                    instance_counts, profiles_base, profiles_full, switched,
+                    n_steps=n_steps)
+                peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw, times, step_hours)
                 rows.append({
                     "tariff": tariff,
                     "dimension": "pv_penetration",
@@ -445,8 +480,8 @@ def interpolate_study_demand(cfg, ncfg, study_dir, elec_levels=None,
                          f"peak={peak_kw:.0f} kW @ {peak_dt}")
 
             # Bookend: 100%
-            total_kw = aggregate_demand(instance_counts, profiles_full)
-            peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw)
+            total_kw = aggregate_demand(instance_counts, profiles_full, n_steps=n_steps)
+            peak_kw, peak_dt, annual_mwh = summarize_demand(total_kw, times, step_hours)
             rows.append({
                 "tariff": tariff,
                 "dimension": "pv_penetration",

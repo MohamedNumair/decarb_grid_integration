@@ -50,12 +50,10 @@ def find_zones(network_dir):
 TEST_MODE_STATEWIDE_ZONES = 3
 
 
-def select_test_zones(cfg, zone_dirs):
-    """In test mode, keep only the configured zone (scope: zone) or the first
-    TEST_MODE_STATEWIDE_ZONES zones (scope: statewide). Unchanged otherwise."""
-    if not cfg.get("test_mode"):
-        return zone_dirs
-
+def select_zones(cfg, zone_dirs):
+    """Zones to work on: only zone.name for scope: zone (full and test runs);
+    every zone for scope: statewide, or the first TEST_MODE_STATEWIDE_ZONES
+    in test mode."""
     if cfg.get("scope") == "zone":
         zone_name = cfg["zone"]["name"]
         selected = [d for d in zone_dirs if d.name == zone_name]
@@ -63,33 +61,94 @@ def select_test_zones(cfg, zone_dirs):
             raise ValueError(
                 f"Zone {zone_name!r} (zone.name in config.yaml) not found in "
                 f"{cfg['paths']['network_dir']}")
-    else:
+        return selected
+
+    if cfg.get("test_mode"):
         selected = zone_dirs[:TEST_MODE_STATEWIDE_ZONES]
+        log.warning(f"TEST MODE: limited to zone(s) {', '.join(d.name for d in selected)}")
+        return selected
+    return zone_dirs
 
-    log.warning(f"TEST MODE: limited to zone(s) {', '.join(d.name for d in selected)}")
-    return selected
+
+DSS_NEW_OBJECT = re.compile(r"^new\s+(\w+)\.(\S+)\s*(.*)$", re.IGNORECASE)
+DSS_PROPERTY = re.compile(r"(\w+)\s*=\s*(\([^)]*\)|\[[^\]]*\]|\"[^\"]*\"|'[^']*'|[^\s]+)")
 
 
-def process_feeder(feeder_path, feeder_name, substation_name, zone_name, counties):
-    loads_file = feeder_path / "Loads.csv"
-    buscoords_file = feeder_path / "Buscoords.csv"
+def _strip_dss_comment(line):
+    for marker in ("!", "//"):
+        line = line.split(marker, 1)[0]
+    return line.strip()
+
+
+def parse_dss_objects(dss_path, object_class):
+    """Read 'New <Class>.<name> key=value ...' definitions from a .dss file.
+
+    Returns a DataFrame with a 'Name' column (without the class prefix) and
+    one column per property, keys lowercased (kV -> kv, kW -> kw)."""
+    rows = []
+    for raw in Path(dss_path).read_text().splitlines():
+        line = _strip_dss_comment(raw)
+        if not line:
+            continue
+        if line.startswith("~") and rows:            # continuation of previous object
+            props_text = line[1:]
+        else:
+            m = DSS_NEW_OBJECT.match(line)
+            if not m or m.group(1).lower() != object_class.lower():
+                continue
+            rows.append({"Name": m.group(2)})
+            props_text = m.group(3)
+        for key, value in DSS_PROPERTY.findall(props_text):
+            rows[-1][key.lower()] = value.strip("\"'")
+
+    df = pd.DataFrame(rows)
+    for col in df.columns:
+        if col != "Name":
+            converted = pd.to_numeric(df[col], errors="coerce")
+            if converted.notna().sum() == df[col].notna().sum():
+                df[col] = converted
+    return df
+
+
+def parse_buscoords(dss_path):
+    """Read 'bus x y' lines (x = longitude, y = latitude) from Buscoords.dss."""
+    rows = []
+    for raw in Path(dss_path).read_text().splitlines():
+        parts = _strip_dss_comment(raw).replace(",", " ").split()
+        if len(parts) >= 3:
+            rows.append((parts[0], float(parts[1]), float(parts[2])))
+    return pd.DataFrame(rows, columns=["Bus_Name", "Longitude", "Latitude"])
+
+
+def read_feeder_loads(feeder_path):
+    """Loads of one feeder with their bus coordinates, read from the SMART-DS
+    Loads.dss and Buscoords.dss. Empty DataFrame if the feeder has neither."""
+    loads_file = feeder_path / "Loads.dss"
+    buscoords_file = feeder_path / "Buscoords.dss"
 
     if not loads_file.exists() or not buscoords_file.exists():
         return pd.DataFrame()
 
-    loads_df = pd.read_csv(loads_file, low_memory=False)
-    buscoords_df = pd.read_csv(buscoords_file)
-
-    buscoords_df = buscoords_df.rename(columns={"Name": "Bus_Name"})
+    loads_df = parse_dss_objects(loads_file, "Load")
+    if loads_df.empty:
+        return loads_df
+    buscoords_df = parse_buscoords(buscoords_file)
 
     loads_df["bus1_base"] = loads_df["bus1"].apply(lambda x: str(x).split(".")[0])
     merged_df = pd.merge(
         loads_df,
-        buscoords_df[["Bus_Name", "Longitude", "Latitude"]],
-        left_on="bus1_base",
-        right_on="Bus_Name",
+        buscoords_df,
+        left_on=loads_df["bus1_base"].str.lower(),
+        right_on=buscoords_df["Bus_Name"].str.lower(),
         how="left",
-    )
+    ).drop(columns=["key_0"], errors="ignore")
+    return merged_df
+
+
+def process_feeder(feeder_path, feeder_name, substation_name, zone_name, counties):
+    merged_df = read_feeder_loads(feeder_path)
+    if merged_df.empty:
+        return merged_df
 
     merged_df[["county", "county_code"]] = merged_df.apply(
         lambda row: pd.Series(
@@ -187,12 +246,14 @@ def process_all_zones(cfg):
 
     zones = find_zones(network_dir)
     if not zones:
-        log.error(f"No zones found in {network_dir}")
-        return None
+        raise FileNotFoundError(
+            f"No SMART-DS zone folders found in {network_dir} (paths.network_dir). "
+            f"Turn on data_acquisition.download_network and run data acquisition.")
 
-    zones = select_test_zones(cfg, zones)
+    zones = select_zones(cfg, zones)
 
-    log.info(f"Processing {len(zones)} zones from {network_dir}")
+    log.info(f"Processing {len(zones)} zone(s) from {network_dir}: "
+             f"{', '.join(z.name for z in zones[:10])}{' ...' if len(zones) > 10 else ''}")
 
     all_dfs = []
     for i, zone_dir in enumerate(zones, 1):
@@ -202,8 +263,10 @@ def process_all_zones(cfg):
         log.info(f"  [{i}/{len(zones)}] {zone_dir.name} done")
 
     if not all_dfs:
-        log.error("No feeder data found across any zone")
-        return None
+        raise ValueError(
+            f"No residential loads found in {', '.join(z.name for z in zones)}: no feeder "
+            f"folder had both Loads.dss and Buscoords.dss with 'res' loads. Check "
+            f"{network_dir}, or re-download the network.")
 
     combined = pd.concat(all_dfs, ignore_index=True)
 

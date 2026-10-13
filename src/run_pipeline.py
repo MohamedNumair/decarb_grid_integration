@@ -53,11 +53,14 @@ def run_preprocess(cfg):
 
     if stages.get("data_acquisition"):
         from data_acquisition import (download_metadata, get_valid_building_ids, download_building_files,
+                                      download_network, network_download_enabled,
                                       download_network_profiles, network_profiles_enabled)
         def _acq():
             download_metadata(cfg)
             ids = get_valid_building_ids(cfg)
             download_building_files(cfg, ids)
+            if network_download_enabled(cfg):
+                download_network(cfg)
             if network_profiles_enabled(cfg):
                 download_network_profiles(cfg)
         _run_stage("Data Acquisition", _acq)

@@ -1,10 +1,12 @@
 """
 OpenDSS Study Runner (Python, multiprocessing)
 ───────────────────────────────────────────────────────────────────────────────
-Runs yearly (8760-hour) power flow simulations for each DECARB case in a study.
+Runs time-series power flow for each DECARB case in a study.
 
-Network model (Master.dss) lives in the template directory — never copied.
-Per-case loadshape CSVs live in the study's opendss/{case}/ directory.
+Each case in the study's opendss/{case}/ directory is self-contained (written
+by network-inputs). The step size and number of steps come from the
+'Solve mode=yearly stepsize=... number=...' line of each feeder's Master.dss,
+so hourly and 15-min cases (and date ranges) run without changes here.
 
 Usage:
     python src/run_opendss.py [--study N] [--workers 20]
@@ -13,6 +15,7 @@ Usage:
 
 import argparse
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -30,10 +33,21 @@ log = logging.getLogger(__name__)
 
 # ── Settings ──────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parents[1]
-TEMPLATE_DIR = PROJECT_ROOT / "in" / "opendss_input_templates"
-ZONE_NAME = "P100U"
-NUM_STEPS = 8760
-STEPSIZE_H = 1  # hourly
+SOLVE_LINE = re.compile(
+    r"^\s*solve\s+mode\s*=\s*yearly\s+stepsize\s*=\s*(\d+)\s*([hm])\s+number\s*=\s*(\d+)",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def read_solve_settings(master_path):
+    """(stepsize string for OpenDSS, step length in hours, number of steps)
+    from the case's 'Solve mode=yearly stepsize=... number=...' line."""
+    m = SOLVE_LINE.search(Path(master_path).read_text())
+    if not m:
+        raise ValueError(f"No 'Solve mode=yearly stepsize=... number=...' line in {master_path}; "
+                         f"re-run network-inputs for this study")
+    size, unit, number = int(m.group(1)), m.group(2).lower(), int(m.group(3))
+    step_hours = size if unit == "h" else size / 60
+    return f"{size}{unit}", step_hours, number
 
 
 # ── Discovery ─────────────────────────────────────────────────────────────
@@ -81,7 +95,7 @@ def discover_feeders(zone_template_dir):
 # ── Worker function (runs in subprocess) ──────────────────────────────────
 
 def simulate_feeder(task):
-    """Run 8760-hour power flow for a single feeder in a single case.
+    """Run the time-series power flow for a single feeder in a single case.
 
     task: dict with keys: case, substation, feeder, master, feeder_dir
     The feeder_dir already contains rewritten LoadShapes.dss and Loads.dss
@@ -100,6 +114,7 @@ def simulate_feeder(task):
     t0 = time.time()
 
     try:
+        stepsize, step_hours, num_steps = read_solve_settings(master_path)
         dss.Text.Command("Clear")
         os.chdir(feeder_dir)
 
@@ -116,15 +131,15 @@ def simulate_feeder(task):
             dss.Text.Command(s)
 
         # Set mode and run
-        dss.Text.Command(f"Set mode=yearly stepsize={STEPSIZE_H}h number=1")
+        dss.Text.Command(f"Set mode=yearly stepsize={stepsize} number=1")
 
-        hours = np.empty(NUM_STEPS)
-        v_min = np.empty(NUM_STEPS)
-        v_max = np.empty(NUM_STEPS)
-        v_mean = np.empty(NUM_STEPS)
-        tot_kw = np.empty(NUM_STEPS)
-        tot_kvar = np.empty(NUM_STEPS)
-        loading = np.empty(NUM_STEPS)
+        hours = np.empty(num_steps)
+        v_min = np.empty(num_steps)
+        v_max = np.empty(num_steps)
+        v_mean = np.empty(num_steps)
+        tot_kw = np.empty(num_steps)
+        tot_kvar = np.empty(num_steps)
+        loading = np.empty(num_steps)
 
         # Get head line for loading measurement
         dss.Lines.First()
@@ -132,14 +147,16 @@ def simulate_feeder(task):
         all_lines = [head_line]
         while dss.Lines.Next() != 0:
             all_lines.append(dss.Lines.Name())
-        # Prefer the head-of-feeder line
-        hs_lines = [l for l in all_lines if "p100uhs" in l.lower()]
+        # Prefer the head-of-feeder line: the one touching the substation,
+        # e.g. "p100uhs" for substation p100uhs0_1247
+        hs_prefix = substation.lower().split("hs")[0] + "hs"
+        hs_lines = [l for l in all_lines if hs_prefix in l.lower()]
         if hs_lines:
             head_line = hs_lines[0]
 
-        for step in range(NUM_STEPS):
+        for step in range(num_steps):
             dss.Solution.Solve()
-            hours[step] = step
+            hours[step] = step * step_hours
 
             # Bus voltages
             all_vmag = dss.Circuit.AllBusMagPu()
@@ -169,7 +186,7 @@ def simulate_feeder(task):
         result_df = pd.DataFrame({
             "feeder": feeder_name,
             "substation": substation,
-            "hour": hours.astype(int),
+            "hour": hours.astype(int) if step_hours == 1 else hours,   # hours since start
             "v_min_pu": v_min,
             "v_max_pu": v_max,
             "v_mean_pu": v_mean,

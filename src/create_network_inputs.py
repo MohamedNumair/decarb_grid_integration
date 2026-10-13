@@ -13,6 +13,7 @@ cases with different network parameters.
 
 import logging
 import os
+import re
 import shutil
 import stat
 import sys
@@ -20,10 +21,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yaml
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from config.loader import load_config, load_network_config, resolve_hour_indices
+from config.loader import (load_config, load_decarb_config, load_network_config,
+                           resolve_hour_indices, resolve_step_indices)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -471,6 +474,44 @@ PF_PV = 0.98           # Grid-tied inverter — near-unity
 PF_BASELINE = 0.95     # Everything else (lighting, plug loads, fridge, water heat, EV)
 
 HOURS_PER_YEAR = 8760
+STEPS_PER_HOUR = {"hourly": 1, "15min": 4}
+
+
+def study_timestep(study_dir):
+    """DECARB timestep a study was generated with, from the decarb.yaml
+    snapshot saved in the study (falls back to the current decarb.yaml)."""
+    snapshot = Path(study_dir) / "decarb.yaml"
+    if snapshot.exists():
+        with open(snapshot) as f:
+            timestep = (yaml.safe_load(f) or {}).get("timestep")
+        source = snapshot
+    else:
+        timestep = load_decarb_config().get("timestep")
+        source = "config/decarb.yaml"
+        log.warning(f"No decarb.yaml snapshot in {study_dir}; using the current "
+                    f"timestep from config/decarb.yaml")
+    if timestep not in STEPS_PER_HOUR:
+        raise ValueError(f"timestep in {source} must be one of "
+                         f"{', '.join(STEPS_PER_HOUR)}, got {timestep!r}")
+    return timestep
+
+
+def select_period(values, step_indices, n_full_year, label):
+    """Cut a DECARB output series to the configured date range.
+
+    A full-year series is cut with step_indices; a series that already has
+    exactly the date range's length (DECARB ran on a cut tm.csv) is used as is.
+    Any other length is an error."""
+    n_period = len(step_indices) if step_indices is not None else n_full_year
+    if len(values) == n_full_year:
+        return values[step_indices] if step_indices is not None else values
+    if len(values) == n_period:
+        return values
+    expected = f"{n_full_year} (full year)"
+    if step_indices is not None:
+        expected += f" or {n_period} (date_range)"
+    raise ValueError(f"{label}: {len(values)} rows, expected {expected} "
+                     f"for this study's timestep")
 
 
 def classify_heating_pf(decarb_case_dir, bldg_id, update=0):
@@ -524,7 +565,8 @@ def compute_kvar_curve(ts_df, pf_ht):
 
 def generate_opendss_loadshapes(decarb_case_dir, building_map_df,
                                 network_dir, zone_name, output_dir, ncfg,
-                                sub_map=None, update=0, hour_indices=None):
+                                sub_map=None, update=0, timestep="hourly",
+                                step_indices=None):
     """Build complete OpenDSS case directories from DECARB outputs.
 
     For each case:
@@ -536,14 +578,21 @@ def generate_opendss_loadshapes(decarb_case_dir, building_map_df,
     The result is a self-contained case directory that run_opendss.py can
     compile and solve with no special logic.
     """
-    # Template directory
-    template_dir = Path(__file__).parents[1] / "in" / "opendss_input_templates"
-    zone_template = template_dir / zone_name / "scenarios" / "base_timeseries" / "opendss"
+    # Feeder templates: the SMART-DS network downloaded into paths.network_dir
+    zone_template = Path(network_dir) / zone_name / "scenarios" / "base_timeseries" / "opendss"
     if not zone_template.exists():
-        log.error(f"Zone template not found: {zone_template}")
-        return
+        raise FileNotFoundError(
+            f"SMART-DS network for zone {zone_name} not found: {zone_template}. Turn on "
+            f"data_acquisition.download_network in config.yaml and run data acquisition.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Time axis of the case: DECARB timestep, cut to date_range
+    steps_per_hour = STEPS_PER_HOUR[timestep]
+    n_full_year = HOURS_PER_YEAR * steps_per_hour
+    n_steps = len(step_indices) if step_indices is not None else n_full_year
+    interval_h = 1 / steps_per_hour
+    stepsize = "1h" if steps_per_hour == 1 else f"{60 // steps_per_hour}m"
 
     # Use all buildings in the map (no zone filtering — matching already did that)
     feeder_df = building_map_df
@@ -591,9 +640,9 @@ def generate_opendss_loadshapes(decarb_case_dir, building_map_df,
         net_kw = (ts_df["buy"].values - ts_df["sell"].values)
         net_kvar = compute_kvar_curve(ts_df, pf_ht)
 
-        if hour_indices is not None:
-            net_kw = net_kw[hour_indices]
-            net_kvar = net_kvar[hour_indices]
+        label = f"{decarb_case_dir.name}/{source_id} ts.csv"
+        net_kw = select_period(net_kw, step_indices, n_full_year, label)
+        net_kvar = select_period(np.asarray(net_kvar), step_indices, n_full_year, label)
 
         # Save under the original bldg_id so DSS file references resolve
         np.savetxt(str(profiles_dir / f"decarb_kw_{bldg_id}.csv"),
@@ -678,9 +727,8 @@ def generate_opendss_loadshapes(decarb_case_dir, building_map_df,
         for bldg_id in sorted(used_bldg_ids):
             kw_file = (profiles_dir / f"decarb_kw_{bldg_id}.csv").as_posix()
             kvar_file = (profiles_dir / f"decarb_kvar_{bldg_id}.csv").as_posix()
-            n_pts = len(hour_indices) if hour_indices is not None else HOURS_PER_YEAR
             shape_lines.append(
-                f"New Loadshape.decarb_{bldg_id} npts={n_pts} interval=1 "
+                f"New Loadshape.decarb_{bldg_id} npts={n_steps} interval={interval_h:g} "
                 f"useactual=true mult=(file={kw_file}) qmult=(file={kvar_file})"
             )
 
@@ -689,14 +737,14 @@ def generate_opendss_loadshapes(decarb_case_dir, building_map_df,
         (dst_feeder_dir / "Loads.dss").write_text(
             "\n\n".join(load_lines) + "\n")
 
-        # Rewrite Master.dss: change solve to hourly
-        n_solve = len(hour_indices) if hour_indices is not None else HOURS_PER_YEAR
+        # Rewrite Master.dss: solve at the case's timestep and length
         master_path = dst_feeder_dir / "Master.dss"
-        master_text = master_path.read_text()
-        master_text = master_text.replace(
-            "Solve mode=yearly stepsize=15m number=35040",
-            f"Solve mode=yearly stepsize=1h number={n_solve}",
-        )
+        master_text, n_replaced = re.subn(
+            r"(?im)^\s*solve\s+mode\s*=\s*yearly\b.*$",
+            f"Solve mode=yearly stepsize={stepsize} number={n_steps}",
+            master_path.read_text())
+        if n_replaced == 0:
+            raise ValueError(f"No 'Solve mode=yearly ...' line to rewrite in {master_path}")
         master_path.write_text(master_text)
 
     log.info(f"OpenDSS case ready: {output_dir}")
@@ -779,6 +827,13 @@ def run_network_inputs(cfg, ncfg=None, study_num=None, update=0):
             log.error("No matching parquet found for OpenDSS case generation")
             return
         feeder_df = read_parquet(feeder_parquet)
+        if "zone" in feeder_df.columns:
+            file_zones = sorted(feeder_df["zone"].dropna().unique())
+            if file_zones != [zone_name]:
+                raise ValueError(
+                    f"{feeder_parquet} is for zone(s) {', '.join(file_zones) or 'none'}, "
+                    f"but zone.name in config.yaml is {zone_name!r}. Set zone.name to the "
+                    f"study's zone, or use a study made for {zone_name}.")
         _run_opendss(cfg, study_dir, decarb_root, decarb_cases,
                      feeder_df, network_dir, zone_name, ncfg, update=update)
     else:
@@ -853,7 +908,11 @@ def _run_opendss(cfg, study_dir, decarb_root, decarb_cases,
                  feeder_df, network_dir, zone_name, ncfg, update=0):
     update_suffix = f"_update_{update}" if update != 0 else ""
     opendss_root = study_dir / "opendss"
-    hour_indices = resolve_hour_indices(cfg)
+    timestep = study_timestep(study_dir)
+    step_indices = resolve_step_indices(cfg, STEPS_PER_HOUR[timestep])
+    n_steps = len(step_indices) if step_indices is not None else HOURS_PER_YEAR * STEPS_PER_HOUR[timestep]
+    log.info(f"OpenDSS cases at {timestep} resolution, {n_steps} steps"
+             + (" (date_range)" if step_indices is not None else " (full year)"))
 
     # Get all building IDs from the matching file
     bldg_col = "nrel_climate_match" if "nrel_climate_match" in feeder_df.columns else "bldg_id"
@@ -872,7 +931,8 @@ def _run_opendss(cfg, study_dir, decarb_root, decarb_cases,
         generate_opendss_loadshapes(
             decarb_case_dir, feeder_df,
             network_dir, zone_name, opendss_case_dir, ncfg,
-            sub_map=sub_map, update=update, hour_indices=hour_indices)
+            sub_map=sub_map, update=update, timestep=timestep,
+            step_indices=step_indices)
 
 
 if __name__ == "__main__":
