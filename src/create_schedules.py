@@ -80,17 +80,9 @@ def run_history_schedules(cfg):
     profiles_dir = input_dir / "residential_profiles" / state
     schedule_dir = input_dir / "schedules" / state
     schedule_dir.mkdir(parents=True, exist_ok=True)
-    release_year = cfg["resstock"]["release_year"]
-    id_file = input_dir / f"resstock_bldg_ids_{state.lower()}_{release_year}.csv"
 
-    if not id_file.exists():
-        log.error(f"Building ID file not found: {id_file}")
-        return
-
-    building_ids = pd.read_csv(str(id_file))["bldg_id"].dropna().astype(int).tolist()
-
-    if cfg.get("test_mode") and cfg.get("test_limit"):
-        building_ids = building_ids[:cfg["test_limit"]]
+    from data_acquisition import load_building_ids
+    building_ids = load_building_ids(cfg)
 
     log.info(f"History method: processing {len(building_ids)} buildings")
 
@@ -239,6 +231,16 @@ def generate_setpoint_timeseries(building_row, freq, year):
     return modes
 
 
+def _limit_to_test_buildings(cfg, meta):
+    """In test mode, keep only the test buildings the other stages run on."""
+    if not (cfg.get("test_mode") and cfg.get("test_limit")):
+        return meta
+    from data_acquisition import load_building_ids
+    meta = meta.loc[meta.index.isin(load_building_ids(cfg))]
+    log.warning(f"TEST MODE: setpoints limited to {len(meta)} test buildings")
+    return meta
+
+
 def run_metadata_setpoints(cfg):
     input_dir = cfg["paths"]["input_dir"]
     output_dir = cfg["paths"]["output_dir"]
@@ -268,9 +270,7 @@ def run_metadata_setpoints(cfg):
         available_ids = meta.index.tolist()
 
     meta = meta.loc[meta.index.isin(available_ids)]
-
-    if cfg.get("test_mode") and cfg.get("test_limit"):
-        meta = meta.head(cfg["test_limit"])
+    meta = _limit_to_test_buildings(cfg, meta)
 
     log.info(f"Metadata method: generating setpoints for {len(meta)} buildings")
 
@@ -391,9 +391,7 @@ def run_setpoints_with_envelope(cfg):
     schedule_files = sorted(schedule_dir.glob("schedule_*.parquet"))
     available_ids = [int(f.stem.replace("schedule_", "")) for f in schedule_files]
     meta = meta.loc[meta.index.isin(available_ids)]
-
-    if cfg.get("test_mode") and cfg.get("test_limit"):
-        meta = meta.head(cfg["test_limit"])
+    meta = _limit_to_test_buildings(cfg, meta)
 
     log.info(f"Generating setpoints with statistical envelope for {len(meta)} buildings")
 

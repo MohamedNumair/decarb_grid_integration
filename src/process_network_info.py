@@ -47,6 +47,29 @@ def find_zones(network_dir):
     return zones
 
 
+TEST_MODE_STATEWIDE_ZONES = 3
+
+
+def select_test_zones(cfg, zone_dirs):
+    """In test mode, keep only the configured zone (scope: zone) or the first
+    TEST_MODE_STATEWIDE_ZONES zones (scope: statewide). Unchanged otherwise."""
+    if not cfg.get("test_mode"):
+        return zone_dirs
+
+    if cfg.get("scope") == "zone":
+        zone_name = cfg["zone"]["name"]
+        selected = [d for d in zone_dirs if d.name == zone_name]
+        if not selected:
+            raise ValueError(
+                f"Zone {zone_name!r} (zone.name in config.yaml) not found in "
+                f"{cfg['paths']['network_dir']}")
+    else:
+        selected = zone_dirs[:TEST_MODE_STATEWIDE_ZONES]
+
+    log.warning(f"TEST MODE: limited to zone(s) {', '.join(d.name for d in selected)}")
+    return selected
+
+
 def process_feeder(feeder_path, feeder_name, substation_name, zone_name, counties):
     loads_file = feeder_path / "Loads.csv"
     buscoords_file = feeder_path / "Buscoords.csv"
@@ -167,9 +190,7 @@ def process_all_zones(cfg):
         log.error(f"No zones found in {network_dir}")
         return None
 
-    if cfg.get("test_mode") and cfg.get("test_limit"):
-        zones = zones[:3]
-        log.info(f"Test mode: limited to {len(zones)} zones")
+    zones = select_test_zones(cfg, zones)
 
     log.info(f"Processing {len(zones)} zones from {network_dir}")
 

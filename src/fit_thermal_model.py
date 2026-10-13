@@ -543,19 +543,9 @@ def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
 # Main
 # ============================================================
 if __name__ == "__main__":
+    from data_acquisition import load_building_ids
     cfg = load_config()
-    input_dir = cfg["paths"]["input_dir"]
-    state = cfg["state"]
-    release_year = cfg["resstock"]["release_year"]
-
-    id_file = input_dir / f"resstock_bldg_ids_{state.lower()}_{release_year}.csv"
-    if not id_file.exists():
-        raise FileNotFoundError(f"Missing building ID list: {id_file}")
-
-    bldg_ids = pd.read_csv(id_file)["bldg_id"].dropna().astype(int).unique()
-
-    if cfg.get("test_mode") and cfg.get("test_limit"):
-        bldg_ids = bldg_ids[: cfg["test_limit"]]
+    bldg_ids = load_building_ids(cfg)
 
     log.info(f"Fitting thermal models for {len(bldg_ids)} buildings")
 

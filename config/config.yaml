@@ -15,6 +15,9 @@ date_range:
 
 # --- Scope ---
 # "statewide" = all of Texas, GenX capacity expansion analysis
+#               NOTE: statewide is NOT up to date. It has not been maintained
+#               alongside the zone workflow and will be reworked for a GenX
+#               transmission analysis. Use "zone".
 # "zone"      = single zone, OpenDSS distribution analysis
 scope: "zone"
 
@@ -31,6 +34,9 @@ test_limit: 600              # max buildings in the candidate pool (ignored when
 state: "MA"
 state_full: "Massachusetts"
 year: 2018
+timezone: "America/New_York"  # IANA time zone of the buildings' timestamps; used for the
+                              # solar position when sizing rooftop PV orientation
+                              # (e.g. "America/Chicago" for TX, "America/New_York" for MA)
 
 # --- Paths (relative to this config file's directory) ---
 paths:
@@ -78,6 +84,6 @@ stages:
 
 # --- Heat Pump Selection ---
 heatpump:
-  neep_database: null         # path to NEEP CSV/Excel (null = input_dir/neep_database.csv)
+  neep_database: null         # path to NEEP CSV/Excel, relative to this file (null = input_dir/neep_database.csv)
   sizing_percentile: 95       # percentile of nonzero load for sizing
   max_units: 10               # max identical units to try if single unit insufficient

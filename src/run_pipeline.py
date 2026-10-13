@@ -44,20 +44,6 @@ def _run_stage(name, fn):
     log.info(f"{name} done ({time.time() - t:.0f}s)")
 
 
-def _get_building_ids(cfg):
-    import pandas as pd
-    input_dir = cfg["paths"]["input_dir"]
-    state = cfg["state"]
-    release_year = cfg["resstock"]["release_year"]
-    id_file = input_dir / f"resstock_bldg_ids_{state.lower()}_{release_year}.csv"
-    if not id_file.exists():
-        raise FileNotFoundError(f"Missing building ID list: {id_file}")
-    bldg_ids = pd.read_csv(str(id_file))["bldg_id"].dropna().astype(int).unique()
-    if cfg.get("test_mode") and cfg.get("test_limit"):
-        bldg_ids = bldg_ids[: cfg["test_limit"]]
-    return bldg_ids
-
-
 # ---------------------------------------------------------------------------
 # Phase 1: Preprocessing
 # ---------------------------------------------------------------------------
@@ -78,7 +64,8 @@ def run_preprocess(cfg):
 
     if stages.get("thermal_model"):
         from fit_thermal_model import run_pipeline as run_thermal_pipeline
-        bldg_ids = _get_building_ids(cfg)
+        from data_acquisition import load_building_ids
+        bldg_ids = load_building_ids(cfg)
         def _thermal():
             use_batching = len(bldg_ids) > 100
             run_thermal_pipeline(

@@ -371,7 +371,6 @@ def run_heatpump_selection(cfg):
     input_dir = cfg["paths"]["input_dir"]
     output_dir = cfg["paths"]["output_dir"]
     state = cfg["state"]
-    release_year = cfg["resstock"]["release_year"]
 
     hp_cfg = cfg.get("heatpump", {})
     percentile, max_units = get_sizing_settings(cfg)
@@ -383,26 +382,22 @@ def run_heatpump_selection(cfg):
         neep_path = input_dir / "neep_database.csv"
 
     if not neep_path.exists():
-        log.error(f"NEEP database not found: {neep_path}")
-        return
+        raise FileNotFoundError(
+            f"NEEP heat pump database not found: {neep_path}. Put the NEEP CSV/Excel "
+            f"there, or set heatpump.neep_database in config.yaml to its path.")
 
     hp_base = load_neep_heat_pumps(neep_path)
 
     metadata_path = input_dir / f"{state}_upgrade0.parquet"
     if not metadata_path.exists():
-        log.error(f"Metadata file not found: {metadata_path}")
-        return
+        raise FileNotFoundError(
+            f"ResStock metadata not found: {metadata_path}. Run the data acquisition "
+            f"stage first (stages.data_acquisition: true in config.yaml).")
     metadata_df = read_parquet(metadata_path, columns=METADATA_COLS)
     metadata_df = metadata_df.set_index("bldg_id")
 
-    id_file = input_dir / f"resstock_bldg_ids_{state.lower()}_{release_year}.csv"
-    if not id_file.exists():
-        log.error(f"Building ID file not found: {id_file}")
-        return
-    building_ids = pd.read_csv(str(id_file))["bldg_id"].dropna().astype(int).tolist()
-
-    if cfg.get("test_mode") and cfg.get("test_limit"):
-        building_ids = building_ids[:cfg["test_limit"]]
+    from data_acquisition import load_building_ids
+    building_ids = load_building_ids(cfg)
 
     state = cfg["state"]
     consumption_dir = input_dir / "residential_profiles" / state

@@ -35,6 +35,33 @@ def _s3_client():
     return boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
 
+def building_id_file(cfg):
+    """Full list of ResStock building IDs for the state (written by acquisition)."""
+    return (cfg["paths"]["input_dir"]
+            / f"resstock_bldg_ids_{cfg['state'].lower()}_{cfg['resstock']['release_year']}.csv")
+
+
+def apply_test_limit(cfg, building_ids):
+    """In test mode, keep the test_limit lowest building IDs; otherwise all."""
+    building_ids = list(building_ids)
+    if cfg.get("test_mode") and cfg.get("test_limit"):
+        limited = sorted(building_ids)[: cfg["test_limit"]]
+        log.warning(f"TEST MODE: using {len(limited)} of {len(building_ids):,} buildings")
+        return limited
+    return building_ids
+
+
+def load_building_ids(cfg):
+    """Building IDs every preprocessing stage runs on (test_limit applied)."""
+    id_file = building_id_file(cfg)
+    if not id_file.exists():
+        raise FileNotFoundError(
+            f"Missing building ID list: {id_file}. Run the data acquisition stage "
+            f"first (stages.data_acquisition: true in config.yaml).")
+    building_ids = pd.read_csv(id_file)["bldg_id"].dropna().astype(int).drop_duplicates()
+    return apply_test_limit(cfg, building_ids)
+
+
 def get_valid_building_ids(cfg):
     s3 = _s3_client()
     bucket = cfg["resstock"]["s3_bucket"]
@@ -64,13 +91,9 @@ def get_valid_building_ids(cfg):
 
     log.info(f"Found {len(building_ids)} building IDs")
 
-    if cfg.get("test_mode") and cfg.get("test_limit"):
-        building_ids = sorted(building_ids)[: cfg["test_limit"]]
-        log.info(f"Test mode: limited to {len(building_ids)} buildings")
-
-    output_dir = cfg["paths"]["input_dir"]
-    output_dir.mkdir(parents=True, exist_ok=True)
-    id_file = output_dir / f"resstock_bldg_ids_{cfg['state'].lower()}_{cfg['resstock']['release_year']}.csv"
+    # Always save the full list; test_limit is applied when the list is read
+    id_file = building_id_file(cfg)
+    id_file.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"bldg_id": building_ids}).to_csv(id_file, index=False)
     log.info(f"Saved building ID list to {id_file}")
 
@@ -79,12 +102,9 @@ def get_valid_building_ids(cfg):
 
 def download_building_files(cfg, building_ids=None):
     if building_ids is None:
-        id_file = cfg["paths"]["input_dir"] / f"resstock_bldg_ids_{cfg['state'].lower()}_{cfg['resstock']['release_year']}.csv"
-        df = pd.read_csv(id_file)
-        building_ids = df["bldg_id"].dropna().astype(int).tolist()
-
-    if cfg.get("test_mode") and cfg.get("test_limit"):
-        building_ids = building_ids[: cfg["test_limit"]]
+        building_ids = load_building_ids(cfg)
+    else:
+        building_ids = apply_test_limit(cfg, building_ids)
 
     s3 = _s3_client()
     bucket = cfg["resstock"]["s3_bucket"]
@@ -224,9 +244,8 @@ def download_network_profiles(cfg, kvar_only=False):
         if d.is_dir()
     )
 
-    if cfg.get("test_mode"):
-        zone_dirs = [d for d in zone_dirs if d.name == "P100U"][:1]
-        log.info(f"Test mode: limited to zone {zone_dirs[0].name if zone_dirs else 'none'}")
+    from process_network_info import select_test_zones
+    zone_dirs = select_test_zones(cfg, zone_dirs)
 
     for zone_dir in zone_dirs:
         opendss_dir = zone_dir / "scenarios" / "base_timeseries" / "opendss"

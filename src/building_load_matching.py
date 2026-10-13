@@ -97,12 +97,18 @@ def load_eligible_buildings(cfg):
             f"outliers, {len(eligible_ids)} remaining, 0 of those found in "
             f"{metadata_path.name}. Check the thermal model results at {thermal_csv}.")
 
-    # In test mode, limit the building pool (not the buses)
+    # In test mode, limit the building pool (not the buses) to the same test
+    # buildings the schedules and heat pump stages ran on
     if cfg.get("test_mode") and cfg.get("test_limit"):
-        limit = cfg["test_limit"]
-        if len(eligible_df) > limit:
-            eligible_df = eligible_df.head(limit).copy()
-            log.info(f"Test mode: building pool limited to {limit}")
+        from data_acquisition import load_building_ids
+        test_ids = set(load_building_ids(cfg))
+        eligible_df = eligible_df[eligible_df["bldg_id"].isin(test_ids)].copy()
+        log.warning(f"TEST MODE: building pool limited to {len(eligible_df)} eligible "
+                    f"of the {len(test_ids)} test buildings")
+        if eligible_df.empty:
+            raise ValueError(
+                "TEST MODE: none of the test buildings passed the thermal model "
+                "filters. Re-run the thermal model with test_mode on, or raise test_limit.")
 
     return eligible_df
 

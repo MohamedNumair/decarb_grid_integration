@@ -1,5 +1,6 @@
 import csv
 import logging
+import os
 import re
 import shutil
 import sys
@@ -285,6 +286,8 @@ def compute_optimal_orientation(lat, lon, alt, tz, tm_df):
 
     weights = np.maximum(sdni, 0.0)
     if weights.sum() <= 0:
+        log.warning(f"No direct normal irradiance (pSdni) at lat={lat}, lon={lon}; "
+                    f"using fallback PV orientation tilt=35, azimuth=180")
         return 35.0, 180.0  # fallback
 
     mean_elevation = float(np.sum(weights * elevation) / weights.sum())
@@ -1108,6 +1111,8 @@ def process_building(args):
                 panel_rating_kw = float(pv_row[2].iloc[0])
                 panel_area_m2 = float(pv_row[3].iloc[0])
             else:
+                log.warning(f"Building {bldg_id}: {PV_TECH} not found in pv.csv "
+                            f"template; using fallback panel 0.34 kW, 1.0 m2")
                 panel_rating_kw = 0.34
                 panel_area_m2 = 1.0
             panel_count = compute_pv_panel_count(consumption_df, panel_rating_kw)
@@ -1120,10 +1125,15 @@ def process_building(args):
                     tm_for_orient = pd.read_csv(str(tm_path), usecols=["pP", "pSdni"])
                     lat = float(building_row["in.weather_file_latitude"].iloc[0])
                     lon = float(building_row["in.weather_file_longitude"].iloc[0])
+                    # Elevation is only looked up when bdg_i is on; otherwise 0 m
+                    # (warned once in run_decarb_inputs)
                     alt = elevation_cache.get((lat, lon), 0.0)
                     pv_tilt, pv_azimuth = compute_optimal_orientation(
-                        lat, lon, alt, "America/Chicago", tm_for_orient)
-                except Exception:
+                        lat, lon, alt, cfg["timezone"], tm_for_orient)
+                except Exception as e:
+                    log.warning(f"Building {bldg_id}: PV orientation failed "
+                                f"({type(e).__name__}: {e}); using fallback "
+                                f"tilt=35, azimuth=180")
                     pv_tilt, pv_azimuth = 35.0, 180.0
 
         sp_df = None
@@ -1174,6 +1184,88 @@ def _next_study_number(decarb_root):
     return max(existing, default=-1) + 1
 
 
+def _required_template_files(outputs):
+    """Template files load_templates() reads for the enabled outputs."""
+    files = []
+    if outputs["bdg_i"]:
+        files.append("bdg_i.csv")
+    if outputs["in"]:
+        files.append("in.csv")
+    if outputs["other"]:
+        files += OTHER_TEMPLATE_FILES
+    if outputs["chp"] or outputs["sp"]:
+        files.append("chp.csv")
+    if outputs["topo"]:
+        files.append("topo.csv")
+    if outputs["hvac"] or outputs["sp"]:
+        files.append("hvac.csv")
+    if outputs["wh"] or outputs["sp"]:
+        files.append("wh.csv")
+    if outputs["sp"]:
+        files.append("sp.csv")
+    return files
+
+
+def _check_required_files(cfg, dcfg, building_ids, metadata_df, hp_summary_df):
+    """Stop before creating a study if any input decarb-inputs needs is missing.
+
+    Global files raise immediately; per-building gaps are collected, written to
+    out/decarb_inputs_missing_files.csv and reported together.
+    """
+    input_dir = cfg["paths"]["input_dir"]
+    output_dir = cfg["paths"]["output_dir"]
+    state = cfg["state"]
+    outputs = dcfg["outputs"]
+
+    template_dir = dcfg["template_dir"]
+    missing_templates = [f for f in _required_template_files(outputs)
+                         if not (template_dir / f).exists()]
+    if missing_templates:
+        raise FileNotFoundError(
+            f"DECARB template file(s) missing from {template_dir}: "
+            f"{', '.join(missing_templates)} (template_dir in decarb.yaml)")
+
+    def _names(d):
+        return set(os.listdir(d)) if d.is_dir() else set()
+
+    profiles = _names(input_dir / "residential_profiles" / state)
+    setpoints = _names(input_dir / "setpoint_timeseries" / state)
+    schedules = _names(input_dir / "schedules" / state)
+    id_col = "bldg_id" if "bldg_id" in metadata_df.columns else "building_id"
+    meta_ids = set(metadata_df[id_col].astype(int))
+    hp_ids = set(hp_summary_df["bldg_id"].astype(int))
+    needs_hp = outputs["chp"] or outputs["hvac"] or outputs["sp"]
+
+    checks = [
+        ("ResStock profile (residential_profiles)", lambda b: f"{b}-0.parquet" in profiles),
+        ("ResStock metadata row", lambda b: b in meta_ids),
+    ]
+    if outputs["tm"]:
+        checks += [
+            ("setpoint file (schedules stage)", lambda b: f"setpoint_{b}.parquet" in setpoints),
+            ("schedule file (schedules stage)", lambda b: f"schedule_{b}.parquet" in schedules),
+        ]
+    if needs_hp:
+        checks.append(("heat pump summary row", lambda b: b in hp_ids))
+
+    missing = [{"bldg_id": b, "missing": what}
+               for b in building_ids for what, ok in checks if not ok(b)]
+    if not missing:
+        log.info(f"All required inputs present for {len(building_ids)} buildings")
+        return
+
+    missing_df = pd.DataFrame(missing)
+    report = output_dir / "decarb_inputs_missing_files.csv"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    missing_df.to_csv(report, index=False)
+    counts = "\n".join(f"  {n:>6}  {what}"
+                       for what, n in missing_df["missing"].value_counts().items())
+    raise FileNotFoundError(
+        f"{missing_df['bldg_id'].nunique()} of {len(building_ids)} buildings are missing "
+        f"inputs (full list: {report}):\n{counts}\n"
+        f"Re-run the preprocessing stage that produces them, then try again.")
+
+
 def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
     """Generate DECARB input files for all cases defined in decarb.yaml.
 
@@ -1205,52 +1297,29 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
             f"first (stages.thermal_model: true in config.yaml), or set "
             f"outputs.bdg_ii: false in decarb.yaml.")
 
+    if dcfg.get("rooftop_solar", {}).get("enabled", False):
+        tz = cfg.get("timezone")
+        if not tz:
+            raise KeyError("config.yaml is missing timezone (needed for rooftop PV "
+                           "orientation), e.g. timezone: \"America/Chicago\"")
+        try:
+            pd.Timestamp(f"{year}-01-01").tz_localize(tz)
+        except Exception as e:
+            raise ValueError(f"timezone {tz!r} in config.yaml is not a valid IANA "
+                             f"time zone name: {e}") from e
+
     if study_dir is not None:
-        # Use the provided existing study directory
         study_dir = Path(study_dir)
         if not study_dir.exists():
-            log.error(f"Provided study_dir does not exist: {study_dir}")
-            return
-        log.info(f"Adding cases to existing study at {study_dir}")
-    else:
-        # Create study directory with next available number
-        studies_root = output_dir / "studies"
-        studies_root.mkdir(parents=True, exist_ok=True)
-        study_num = _next_study_number(studies_root)
-        study_dir = studies_root / f"study_{study_num}"
-        study_dir.mkdir()
-        log.info(f"Created study_{study_num} at {study_dir}")
+            raise FileNotFoundError(f"Provided study_dir does not exist: {study_dir}")
 
-        # Prompt user for study description and log it
-        description = input(f"Enter a description for study_{study_num}: ").strip()
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        study_log = studies_root / "study_log.csv"
-        write_header = not study_log.exists()
-        with open(study_log, "a", newline="") as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow(["study_id", "timestamp", "description"])
-            writer.writerow([f"study_{study_num}", timestamp, description])
-
-    # Save copies of the config files that generated this study
-    config_dir = Path(__file__).parents[1] / "config"
-    for cfg_file in ("config.yaml", "decarb.yaml", "network.yaml"):
-        src = config_dir / cfg_file
-        if src.exists():
-            shutil.copy2(str(src), str(study_dir / cfg_file))
-            log.info(f"Saved {cfg_file} to study directory")
-        else:
-            log.warning(f"Config file not found: {src}")
-
-    # Save the matching file into the study (ties buildings to this study)
+    # ── Resolve and check every input before creating the study ──────────
+    # Building IDs: the study's own matching file if adding to an existing
+    # study that has one, else the matching file a new study would copy in
     matching_src = input_dir / "feeder_summaries_matched.parquet"
-    matching_dst = study_dir / "feeder_summaries_matched.parquet"
-    if matching_src.exists() and not matching_dst.exists():
-        shutil.copy2(str(matching_src), str(matching_dst))
-        log.info(f"Saved matching file to study: {matching_dst.name}")
-
-    # Load building IDs — prefer matched buildings from the study
-    matching_file = study_dir / "feeder_summaries_matched.parquet"
+    matching_file = matching_src
+    if study_dir is not None and (study_dir / "feeder_summaries_matched.parquet").exists():
+        matching_file = study_dir / "feeder_summaries_matched.parquet"
     if matching_file.exists():
         matched_df = read_parquet(matching_file)
         bldg_col = "nrel_climate_match" if "nrel_climate_match" in matched_df.columns else "nrel_county_match"
@@ -1260,19 +1329,17 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
         log.info(f"Building IDs from matching: {len(building_ids)} unique buildings")
     else:
         # Fallback: raw ID file (no matching available yet)
-        release_year = cfg["resstock"]["release_year"]
-        id_file = input_dir / f"resstock_bldg_ids_{state.lower()}_{release_year}.csv"
-        if not id_file.exists():
-            log.error(f"Building ID file not found: {id_file}")
-            return
-        building_ids = pd.read_csv(str(id_file))["bldg_id"].dropna().astype(int).tolist()
-        if cfg.get("test_mode") and cfg.get("test_limit"):
-            building_ids = building_ids[:cfg["test_limit"]]
+        from data_acquisition import load_building_ids
+        building_ids = load_building_ids(cfg)
         log.info(f"Building IDs from ID file: {len(building_ids)} "
                  f"(no matching file in study)")
 
     # Load metadata
     meta_path = input_dir / f"{state}_upgrade0.parquet"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"ResStock metadata not found: {meta_path}. Run the data acquisition "
+            f"stage first (stages.data_acquisition: true in config.yaml).")
     metadata_df = read_parquet(meta_path)
 
     # Load regression coefficients from the thermal model stage
@@ -1307,9 +1374,12 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
     # Load HP summary
     hp_summary_path = output_dir / "heatpump_files" / state / "building_hp_summary.csv"
     if not hp_summary_path.exists():
-        log.error(f"HP summary not found: {hp_summary_path}")
-        return
+        raise FileNotFoundError(
+            f"Heat pump summary not found: {hp_summary_path}. Run the heat pump "
+            f"selection stage first (stages.heatpump_selection: true in config.yaml).")
     hp_summary_df = pd.read_csv(str(hp_summary_path))
+
+    _check_required_files(cfg, dcfg, building_ids, metadata_df, hp_summary_df)
 
     # Load templates
     templates = load_templates(dcfg["template_dir"], outputs)
@@ -1326,6 +1396,48 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
             subset[[lat_col, lon_col]].astype(float).drop_duplicates().itertuples(
                 index=False, name=None))
         elevation_cache = build_elevation_cache(unique_coords, max_workers=20)
+    elif dcfg.get("rooftop_solar", {}).get("enabled", False):
+        log.warning("outputs.bdg_i is off, so no elevations are looked up; PV "
+                    "orientation will use 0 m elevation for every building")
+
+    # ── All inputs are in place: create or reuse the study ───────────────
+    if study_dir is not None:
+        log.info(f"Adding cases to existing study at {study_dir}")
+    else:
+        # Create study directory with next available number
+        studies_root = output_dir / "studies"
+        studies_root.mkdir(parents=True, exist_ok=True)
+        study_num = _next_study_number(studies_root)
+        study_dir = studies_root / f"study_{study_num}"
+        study_dir.mkdir()
+        log.info(f"Created study_{study_num} at {study_dir}")
+
+        # Prompt user for study description and log it
+        description = input(f"Enter a description for study_{study_num}: ").strip()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        study_log = studies_root / "study_log.csv"
+        write_header = not study_log.exists()
+        with open(study_log, "a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["study_id", "timestamp", "description"])
+            writer.writerow([f"study_{study_num}", timestamp, description])
+
+    # Save copies of the config files that generated this study
+    config_dir = Path(__file__).parents[1] / "config"
+    for cfg_file in ("config.yaml", "decarb.yaml", "network.yaml"):
+        src = config_dir / cfg_file
+        if src.exists():
+            shutil.copy2(str(src), str(study_dir / cfg_file))
+            log.info(f"Saved {cfg_file} to study directory")
+        else:
+            log.warning(f"Config file not found: {src}")
+
+    # Save the matching file into the study (ties buildings to this study)
+    matching_dst = study_dir / "feeder_summaries_matched.parquet"
+    if matching_src.exists() and not matching_dst.exists():
+        shutil.copy2(str(matching_src), str(matching_dst))
+        log.info(f"Saved matching file to study: {matching_dst.name}")
 
     # Build case list
     elec_levels = dcfg["electrification"]["levels"]

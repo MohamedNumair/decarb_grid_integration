@@ -36,6 +36,11 @@ def load_config(config_path=None):
             p = config_dir / p
         cfg["paths"][key] = p
 
+    hp_cfg = cfg.get("heatpump") or {}
+    if hp_cfg.get("neep_database"):
+        p = Path(hp_cfg["neep_database"])
+        hp_cfg["neep_database"] = p if p.is_absolute() else config_dir / p
+
     _config = cfg
     return cfg
 
