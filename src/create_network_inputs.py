@@ -26,7 +26,7 @@ from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from config.loader import (load_config, load_decarb_config, load_network_config,
-                           resolve_hour_indices, resolve_step_indices)
+                           resolve_hour_indices, resolve_step_indices, resolve_timestep)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -478,18 +478,26 @@ STEPS_PER_HOUR = {"hourly": 1, "15min": 4}
 
 
 def study_timestep(study_dir):
-    """DECARB timestep a study was generated with, from the decarb.yaml
-    snapshot saved in the study (falls back to the current decarb.yaml)."""
-    snapshot = Path(study_dir) / "decarb.yaml"
-    if snapshot.exists():
-        with open(snapshot) as f:
-            timestep = (yaml.safe_load(f) or {}).get("timestep")
-        source = snapshot
+    """Timestep a study was generated with, from the config snapshots saved in
+    the study: config.yaml, or decarb.yaml for studies made before the
+    timestep moved there. Falls back to the current config with a warning."""
+    def _snapshot(name):
+        path = Path(study_dir) / name
+        if not path.exists():
+            return None
+        with open(path) as f:
+            return (yaml.safe_load(f) or {}).get("timestep")
+
+    for name in ("config.yaml", "decarb.yaml"):
+        timestep = _snapshot(name)
+        if timestep is not None:
+            source = Path(study_dir) / name
+            break
     else:
-        timestep = load_decarb_config().get("timestep")
-        source = "config/decarb.yaml"
-        log.warning(f"No decarb.yaml snapshot in {study_dir}; using the current "
-                    f"timestep from config/decarb.yaml")
+        log.warning(f"No timestep in the config snapshots of {study_dir}; "
+                    f"using the current config")
+        return resolve_timestep(load_config(), load_decarb_config())
+
     if timestep not in STEPS_PER_HOUR:
         raise ValueError(f"timestep in {source} must be one of "
                          f"{', '.join(STEPS_PER_HOUR)}, got {timestep!r}")

@@ -6,13 +6,7 @@
 #   electrification level × tariff × solar penetration
 # ============================================================
 
-# --- Timestep ---
-# Resolution of everything from DECARB onward: tm.csv, the thermal coefficients
-# in bdg_ii.csv (converted from the 15-min fit), and the OpenDSS cases and
-# interpolation built from the study. Preprocessing is always 15-min (ResStock).
-# Each study keeps a copy of this file, so network-inputs uses the timestep
-# the study was generated with. (GenX demand is still hourly-only.)
-timestep: "hourly"          # "hourly" or "15min"
+# (The DECARB timestep is set in config.yaml, below date_range.)
 
 # --- Electrification ---
 electrification:

@@ -228,6 +228,10 @@ def main():
                         help="DECARB update number to run (default: 0)")
     args = parser.parse_args()
 
+    # When started by run_pipeline.py, also write to that run's log file
+    from run_log import attach_run_log
+    attach_run_log()
+
     cfg = load_config()
     output_dir = cfg["paths"]["output_dir"]
     study_dir = find_study_dir(output_dir, args.study)

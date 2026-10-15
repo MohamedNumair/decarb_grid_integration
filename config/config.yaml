@@ -15,6 +15,14 @@ date_range:
   start: "Jan 1"
   end: "Dec 31"
 
+# --- Timestep ---
+# Resolution of everything from DECARB onward: tm.csv, the thermal coefficients
+# in bdg_ii.csv (converted from the 15-min fit), and the OpenDSS cases and
+# interpolation built from a study. Preprocessing is always 15-min (ResStock).
+# Each study keeps a copy of this file, so network-inputs uses the timestep the
+# study was generated with. (GenX demand is still hourly-only.)
+timestep: "hourly"            # "hourly" or "15min"
+
 # --- Scope ---
 # "statewide" = all of Texas, GenX capacity expansion analysis
 #               NOTE: statewide is NOT up to date. It has not been maintained
@@ -45,7 +53,7 @@ paths:
   project_root: ".."
   input_dir: "../in"
   output_dir: "../out"
-  network_dir: "D:/smartds"
+  network_dir: "../in/smartds"   # SMART-DS feeder network, downloaded per zone
   county_shapefile: "../in/us_county_boundaries/us-county-boundaries.shp"
 
 # --- ResStock / OEDI Data ---
@@ -61,6 +69,7 @@ smartds:
 
 # --- Data Acquisition (only used when stages.data_acquisition: true) ---
 data_acquisition:
+  download_workers: 16              # parallel downloads (ResStock profiles, network, profiles)
   download_network: true            # download the SMART-DS feeder .dss files for the zone(s)
                                     # into paths.network_dir (files already there are skipped)
   download_network_profiles: false  # download the SMART-DS kw + kvar loadshape profiles referenced

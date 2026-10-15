@@ -114,6 +114,7 @@ def run_decarb_inputs(cfg):
     log.info(f"Study: {study_dir}")
     log.info("Next: run DECARB optimizer on the generated inputs, then "
              "use 'network-inputs' to aggregate results.")
+    return study_dir
 
 
 # ---------------------------------------------------------------------------
@@ -262,24 +263,42 @@ def main():
                      help="Study number to use (default: latest)")
 
     args = parser.parse_args()
-    cfg = load_config()
-
-    if args.command == "preprocess":
-        run_preprocess(cfg)
-    elif args.command == "decarb-inputs":
-        run_decarb_inputs(cfg)
-    elif args.command == "network-inputs":
-        run_network_inputs(cfg, args)
-    elif args.command == "opendss":
-        run_opendss(cfg, args)
-    elif args.command == "results":
-        from plot_results import main as plot_main
-        sys.argv = ["plot_results.py"]
-        if args.study is not None:
-            sys.argv += ["--study", str(args.study)]
-        plot_main()
-    else:
+    if args.command is None:
         parser.print_help()
+        return
+
+    cfg = load_config()
+    from run_log import start_run_log
+    log_path = start_run_log(cfg, args.command)
+    log.info(f"Run: {' '.join(sys.argv[1:])} | config: {PROJECT_ROOT / 'config' / 'config.yaml'} | "
+             f"log: {log_path}")
+
+    t_start = time.time()
+    study_dir = None
+    try:
+        if args.command == "preprocess":
+            run_preprocess(cfg)
+        elif args.command == "decarb-inputs":
+            study_dir = run_decarb_inputs(cfg)
+        elif args.command == "network-inputs":
+            run_network_inputs(cfg, args)
+        elif args.command == "opendss":
+            run_opendss(cfg, args)
+        elif args.command == "results":
+            from plot_results import main as plot_main
+            sys.argv = ["plot_results.py"]
+            if args.study is not None:
+                sys.argv += ["--study", str(args.study)]
+            plot_main()
+    except BaseException:
+        log.exception(f"Run FAILED after {time.time() - t_start:.0f}s (log: {log_path})")
+        raise
+    log.info(f"Run finished in {time.time() - t_start:.0f}s (log: {log_path})")
+
+    # Keep the log of the run that created a study inside that study
+    if study_dir is not None:
+        import shutil
+        shutil.copy2(str(log_path), str(Path(study_dir) / "decarb_inputs.log"))
 
 
 if __name__ == "__main__":

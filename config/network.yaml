@@ -29,8 +29,8 @@ genx:
   cost_mwh: 2000
 
 # --- OpenDSS (scope = "zone") ---
-# No settings here: OpenDSS cases use the DECARB timestep of the study
-# (decarb.yaml -> timestep) and date_range from config.yaml.
+# No settings here: OpenDSS cases use the study's timestep and date_range
+# (config.yaml).
 
 # --- Interpolation ---
 # When enabled, interpolate_demand.py computes intermediate electrification

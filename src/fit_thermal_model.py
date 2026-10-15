@@ -364,6 +364,8 @@ def compute_regression_coefficients(all_ts_dict, required_columns=None, skipped=
 def _worker(args):
     (batch_idx, batch_ids, cfg, feature_sets, save_outputs, tmp_dir) = args
 
+    from run_log import attach_run_log
+    attach_run_log()
     skipped = []
     try:
         ts_dict = create_building_timeseries(
@@ -413,6 +415,40 @@ def _raise_if_nothing_fitted(n_fitted, feature_name, skipped_csv):
             f"See {skipped_csv} for why each building was skipped.")
 
 
+# Bump when the fitting logic changes in a way that affects the coefficients,
+# so existing results are refitted instead of reused (see stage_record.py)
+THERMAL_MODEL_VERSION = 1
+
+
+def thermal_stage_settings(cfg, feature_sets):
+    """Everything the fitted coefficients depend on (for the stage record)."""
+    return {
+        "version": THERMAL_MODEL_VERSION,
+        "state": cfg["state"],
+        "resstock_release": cfg["resstock"]["release"],
+        "resstock_release_year": cfg["resstock"]["release_year"],
+        "feature_sets": feature_sets,
+        "gain_fractions": {"lighting": LIGHTING_FRACTION, "equipment": EQUIPMENT_FRACTION,
+                           "dhw": DHW_FRACTION},
+    }
+
+
+def _save_results(cfg, feature_name, new_df, existing_df, skipped_csv):
+    """Write this run's fits merged with fits reused from earlier runs."""
+    parts = [d for d in (existing_df, new_df) if d is not None and not d.empty]
+    combined = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    if not combined.empty:
+        combined = (combined.drop_duplicates(subset="bldg_id", keep="last")
+                    .sort_values("bldg_id").reset_index(drop=True))
+    _raise_if_nothing_fitted(len(combined), feature_name, skipped_csv)
+    out_csv = thermal_coeff_csv_path(cfg, feature_name)
+    combined.to_csv(out_csv, index=False)
+    combined.to_parquet(out_csv.with_suffix(".parquet"), index=False)
+    reused = 0 if existing_df is None else len(existing_df)
+    log.info(f"Saved {feature_name}: {len(combined)} buildings ({len(new_df)} fitted now, "
+             f"{reused} reused) -> {out_csv}")
+
+
 # ============================================================
 # Run pipeline
 # ============================================================
@@ -425,7 +461,29 @@ def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
     if feature_sets is None:
         feature_sets = FEATURE_SETS
 
-    bldg_ids_list = list(bldg_ids)
+    bldg_ids_list = [int(b) for b in bldg_ids]
+
+    # Reuse fits from an earlier finished run with the same settings
+    from stage_record import can_reuse, write_record
+    record_path = results_dir / "stage_record.json"
+    settings = thermal_stage_settings(cfg, feature_sets)
+    existing = {name: None for name in feature_sets}
+    if can_reuse(record_path, settings, "Thermal model"):
+        for name in feature_sets:
+            csv_path = thermal_coeff_csv_path(cfg, name)
+            if csv_path.exists():
+                existing[name] = pd.read_csv(csv_path)
+        if all(df is not None for df in existing.values()):
+            done = set.intersection(*(set(df["bldg_id"].astype(int)) for df in existing.values()))
+            n_requested = len(bldg_ids_list)
+            bldg_ids_list = [b for b in bldg_ids_list if b not in done]
+            log.info(f"Thermal model: {n_requested - len(bldg_ids_list)} of {n_requested} "
+                     f"buildings already fitted; fitting {len(bldg_ids_list)}")
+            if not bldg_ids_list:
+                return
+        else:
+            existing = {name: None for name in feature_sets}
+    write_record(record_path, settings, "running")
     total = len(bldg_ids_list)
 
     for feature_name, feature_cols in feature_sets.items():
@@ -496,14 +554,9 @@ def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
         log.info("Merging batch results...")
         for feature_name in feature_sets:
             tmp_files = sorted(tmp_dir.glob(f"{feature_name}_batch_*.parquet"))
-            _raise_if_nothing_fitted(len(tmp_files), feature_name, skipped_csv)
-
-            merged_df = pd.concat([pd.read_parquet(f) for f in tmp_files], ignore_index=True)
-            out_csv     = thermal_coeff_csv_path(cfg, feature_name)
-            out_parquet = out_csv.with_suffix(".parquet")
-            merged_df.to_csv(out_csv, index=False)
-            merged_df.to_parquet(out_parquet, index=False)
-            log.info(f"Saved {feature_name}: {len(merged_df)} buildings -> {out_csv}")
+            merged_df = (pd.concat([pd.read_parquet(f) for f in tmp_files], ignore_index=True)
+                         if tmp_files else pd.DataFrame())
+            _save_results(cfg, feature_name, merged_df, existing[feature_name], skipped_csv)
 
             for f in tmp_files:
                 f.unlink()
@@ -530,13 +583,10 @@ def run_pipeline(cfg, bldg_ids, feature_sets=None, save_outputs=False,
         skipped_csv = _report_skipped(skipped, results_dir, total)
 
         for feature_name, results in all_results.items():
-            _raise_if_nothing_fitted(len(results), feature_name, skipped_csv)
-            results_df = pd.DataFrame(results)
-            out_csv     = thermal_coeff_csv_path(cfg, feature_name)
-            out_parquet = out_csv.with_suffix(".parquet")
-            results_df.to_csv(out_csv, index=False)
-            results_df.to_parquet(out_parquet, index=False)
-            log.info(f"Saved {feature_name}: {len(results_df)} buildings -> {out_csv}")
+            _save_results(cfg, feature_name, pd.DataFrame(results),
+                          existing[feature_name], skipped_csv)
+
+    write_record(record_path, settings, "done")
 
 
 # ============================================================

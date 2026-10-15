@@ -141,6 +141,30 @@ def resolve_hour_indices(cfg):
     return indices
 
 
+TIMESTEPS = ("hourly", "15min")
+
+
+def resolve_timestep(cfg, dcfg=None, source="config.yaml"):
+    """DECARB-onward time resolution: config.yaml 'timestep'. An older
+    decarb.yaml 'timestep' is still accepted (with a warning) when config.yaml
+    has none; if both are set they must agree."""
+    import logging
+    log = logging.getLogger(__name__)
+    timestep = cfg.get("timestep")
+    old = (dcfg or {}).get("timestep")
+    if timestep is None and old is not None:
+        log.warning("'timestep' in decarb.yaml is deprecated; move it to config.yaml "
+                    "(below date_range)")
+        timestep, source = old, "decarb.yaml"
+    elif timestep is not None and old is not None and old != timestep:
+        raise ValueError(f"timestep is {timestep!r} in config.yaml but {old!r} in "
+                         f"decarb.yaml; remove it from decarb.yaml")
+    if timestep not in TIMESTEPS:
+        raise ValueError(f"timestep in {source} must be one of {', '.join(TIMESTEPS)}, "
+                         f"got {timestep!r}")
+    return timestep
+
+
 def resolve_step_indices(cfg, steps_per_hour):
     """Like resolve_hour_indices, but indices into a year of steps_per_hour
     steps per hour (4 for 15-min data). Returns None for the full year."""

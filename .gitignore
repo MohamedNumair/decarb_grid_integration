@@ -1,6 +1,7 @@
 .env
 __pycache__/
 *.pyc
+in/
 out/
 *.parquet
 *.7z

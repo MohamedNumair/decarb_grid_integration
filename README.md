@@ -28,7 +28,7 @@ Downloaded automatically by the data acquisition stage. Everything is public, an
 |---|---|---|
 | ResStock metadata (`{STATE}_upgrade0.parquet`, plus a `.csv.gz` copy for manual inspection) | OEDI S3 `oedi-data-lake`, `resstock` settings in `config.yaml` | `in/` |
 | ResStock 15-min building profiles | same | `in/residential_profiles/{STATE}/` |
-| SMART-DS feeder network (`.dss` files for the zone) | OEDI S3, `smartds` settings in `config.yaml` | `paths.network_dir` |
+| SMART-DS feeder network (`.dss` files for the zone) | OEDI S3, `smartds` settings in `config.yaml` | `paths.network_dir` (default `in/smartds/`) |
 
 Provided by you:
 
@@ -44,8 +44,8 @@ The building state and the network do not have to match. For example, NY or MA b
 
 | File | Controls |
 |---|---|
-| `config/config.yaml` | state/year/time zone, zone, paths, test mode, which preprocessing stages run, matching, heat pump sizing, date range |
-| `config/decarb.yaml` | DECARB timestep, tariffs, electrification levels, rooftop solar, which DECARB input files to write |
+| `config/config.yaml` | state/year/time zone, zone, paths, test mode, which preprocessing stages run, matching, heat pump sizing, date range and timestep |
+| `config/decarb.yaml` | tariffs, electrification levels, rooftop solar, which DECARB input files to write |
 | `config/network.yaml` | GenX settings (statewide only), interpolation, workers |
 
 Settings a new user usually changes:
@@ -55,7 +55,7 @@ state: "NY"                   # ResStock state of the buildings
 timezone: "America/New_York"  # time zone of the buildings (PV orientation)
 zone: {name: "P101U"}         # SMART-DS zone (feeder network) to use
 paths:
-  network_dir: "D:/smartds"   # keep this path short on Windows (260-character path limit)
+  network_dir: "../in/smartds"  # on Windows keep the project path short (260-character path limit)
 test_mode: true               # 600 buildings and one zone, for a quick end-to-end check
 stages: {...: true}           # turn on the preprocessing stages you need
 ```
@@ -108,7 +108,7 @@ Outside this Python pipeline: edit the settings block at the top of `src/run_dec
 python src/run_pipeline.py network-inputs --study N
 ```
 
-Builds `out/studies/study_N/opendss/{case}/`. It copies the zone's feeders from `network_dir`, and replaces each matched residential load with that building's DECARB profile (kW and reconstructed kvar). The time axis follows the study's own `decarb.yaml` timestep and `date_range`. With `interpolation.enabled: true` in `network.yaml`, it also writes intermediate electrification/solar penetration levels (see below).
+Builds `out/studies/study_N/opendss/{case}/`. It copies the zone's feeders from `network_dir`, and replaces each matched residential load with that building's DECARB profile (kW and reconstructed kvar). The time axis follows the `timestep` and `date_range` saved in the study's own `config.yaml`. With `interpolation.enabled: true` in `network.yaml`, it also writes intermediate electrification/solar penetration levels (see below).
 
 ### 4.5 OpenDSS and results
 
@@ -124,7 +124,7 @@ The OpenDSS runner reads each case's step size and length from its `Master.dss`,
 | Part | Resolution |
 |---|---|
 | ResStock data, thermal fit, schedules, heat pump sizing | always 15-min |
-| DECARB inputs, OpenDSS cases, interpolation | `decarb.yaml` → `timestep` (`hourly` or `15min`) |
+| DECARB inputs, OpenDSS cases, interpolation | `config.yaml` → `timestep` (`hourly` or `15min`) |
 | GenX demand | hourly only |
 
 ## 6. Interpolation
@@ -137,7 +137,9 @@ DECARB runs only the 0% and 100% bookends of each dimension (electrification, so
 config/                     config.yaml, decarb.yaml, network.yaml
 src/                        pipeline stages; src/extras/ holds one-off analysis scripts
 in/                         downloaded and preprocessed inputs (not in git)
+  smartds/                  SMART-DS feeder network, one folder per zone
 out/
+  logs/                     one log file per run_pipeline.py command ({command}_{date_time}.log)
   thermal_model_outputs/    thermal fits per state
   heatpump_files/           heat pump selection per state
   studies/

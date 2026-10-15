@@ -71,7 +71,7 @@ def compute_schedule_history(parquet_path, hysteresis):
     return timestamps, schedule
 
 
-def run_history_schedules(cfg):
+def run_history_schedules(cfg, skip_existing=False):
     input_dir = cfg["paths"]["input_dir"]
     output_dir = cfg["paths"]["output_dir"]
     hysteresis = cfg["schedules"]["hysteresis"]
@@ -83,6 +83,12 @@ def run_history_schedules(cfg):
 
     from data_acquisition import load_building_ids
     building_ids = load_building_ids(cfg)
+    if skip_existing:
+        n_requested = len(building_ids)
+        building_ids = [b for b in building_ids
+                        if not (schedule_dir / f"schedule_{b}.parquet").exists()]
+        log.info(f"Schedules: {n_requested - len(building_ids)} of {n_requested} "
+                 f"buildings already done")
 
     log.info(f"History method: processing {len(building_ids)} buildings")
 
@@ -241,7 +247,14 @@ def _limit_to_test_buildings(cfg, meta):
     return meta
 
 
-def run_metadata_setpoints(cfg):
+def _drop_existing_setpoints(meta, setpoint_dir):
+    """Leave out buildings whose setpoint file already exists."""
+    exists = [(setpoint_dir / f"setpoint_{b}.parquet").exists() for b in meta.index]
+    log.info(f"Setpoints: {sum(exists)} of {len(meta)} buildings already done")
+    return meta.loc[[not e for e in exists]]
+
+
+def run_metadata_setpoints(cfg, skip_existing=False):
     input_dir = cfg["paths"]["input_dir"]
     output_dir = cfg["paths"]["output_dir"]
     state = cfg["state"]
@@ -271,6 +284,8 @@ def run_metadata_setpoints(cfg):
 
     meta = meta.loc[meta.index.isin(available_ids)]
     meta = _limit_to_test_buildings(cfg, meta)
+    if skip_existing:
+        meta = _drop_existing_setpoints(meta, setpoint_dir)
 
     log.info(f"Metadata method: generating setpoints for {len(meta)} buildings")
 
@@ -368,7 +383,7 @@ def compute_statistical_comfort_envelope(combined_ts, consumption_df,
     return combined_ts
 
 
-def run_setpoints_with_envelope(cfg):
+def run_setpoints_with_envelope(cfg, skip_existing=False):
     """Generate setpoints: metadata base + schedule combine + statistical envelope."""
     input_dir = cfg["paths"]["input_dir"]
     state = cfg["state"]
@@ -392,6 +407,8 @@ def run_setpoints_with_envelope(cfg):
     available_ids = [int(f.stem.replace("schedule_", "")) for f in schedule_files]
     meta = meta.loc[meta.index.isin(available_ids)]
     meta = _limit_to_test_buildings(cfg, meta)
+    if skip_existing:
+        meta = _drop_existing_setpoints(meta, setpoint_dir)
 
     log.info(f"Generating setpoints with statistical envelope for {len(meta)} buildings")
 
@@ -462,21 +479,47 @@ def run_setpoints_with_envelope(cfg):
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_schedules(cfg):
-    method = cfg["schedules"]["method"]
+# Bump when the schedule or setpoint logic changes in a way that affects the
+# outputs, so existing files are regenerated instead of reused (stage_record.py)
+SCHEDULES_VERSION = 1
 
+
+def schedules_stage_settings(cfg):
+    """Everything the schedule and setpoint files depend on (for the stage record)."""
+    sc = cfg["schedules"]
+    return {
+        "version": SCHEDULES_VERSION,
+        "state": cfg["state"],
+        "year": cfg["year"],
+        "method": sc["method"],
+        "resolution": sc["resolution"],
+        "hysteresis": sc["hysteresis"],
+    }
+
+
+def run_schedules(cfg):
+    from stage_record import can_reuse, write_record
+
+    method = cfg["schedules"]["method"]
+    if method not in ("history", "metadata"):
+        raise ValueError(f"schedules.method in config.yaml must be 'history' or "
+                         f"'metadata', got {method!r}")
+
+    record_path = cfg["paths"]["input_dir"] / "schedules" / cfg["state"] / "stage_record.json"
+    settings = schedules_stage_settings(cfg)
+    skip_existing = can_reuse(record_path, settings, "Schedules")
+    write_record(record_path, settings, "running")
+
+    log.info("Step 1: Generating season schedules from consumption data")
+    run_history_schedules(cfg, skip_existing=skip_existing)
     if method == "history":
-        log.info("Step 1: Generating season schedules from consumption data")
-        run_history_schedules(cfg)
         log.info("Step 2: Generating setpoints with statistical comfort envelope")
-        run_setpoints_with_envelope(cfg)
-    elif method == "metadata":
-        log.info("Step 1: Generating season schedules from consumption data")
-        run_history_schedules(cfg)
-        log.info("Step 2: Generating setpoint timeseries from metadata (no envelope)")
-        run_metadata_setpoints(cfg)
+        run_setpoints_with_envelope(cfg, skip_existing=skip_existing)
     else:
-        log.error(f"Unknown schedule method: {method}. Use 'history' or 'metadata'")
+        log.info("Step 2: Generating setpoint timeseries from metadata (no envelope)")
+        run_metadata_setpoints(cfg, skip_existing=skip_existing)
+
+    write_record(record_path, settings, "done")
 
 
 if __name__ == "__main__":

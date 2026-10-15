@@ -16,7 +16,8 @@ import pvlib
 import requests
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from config.loader import load_config, load_decarb_config, resolve_step_indices
+from config.loader import (load_config, load_decarb_config, resolve_step_indices,
+                           resolve_timestep)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -1027,6 +1028,8 @@ _worker_state = {}
 
 def _worker_init(cfg, dcfg, metadata_df, regression_coeffs,
                  templates, elevation_cache, hp_summary_df, study_dir):
+    from run_log import attach_run_log
+    attach_run_log()
     _worker_state["cfg"] = cfg
     _worker_state["dcfg"] = dcfg
     _worker_state["year"] = cfg["year"]
@@ -1312,10 +1315,9 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
     year = cfg["year"]
     outputs = dcfg["outputs"]
 
-    timestep = dcfg.get("timestep")
-    if timestep not in TIMESTEP_FIT_STEPS:
-        raise ValueError(f"timestep in decarb.yaml must be one of "
-                         f"{', '.join(TIMESTEP_FIT_STEPS)}, got {timestep!r}")
+    # Timestep lives in config.yaml; the per-building code reads dcfg["timestep"]
+    timestep = resolve_timestep(cfg, dcfg)
+    dcfg = dict(dcfg, timestep=timestep)
 
     # Check thermal model results before creating a study directory
     from fit_thermal_model import thermal_coeff_csv_path

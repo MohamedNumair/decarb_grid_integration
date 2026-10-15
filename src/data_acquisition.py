@@ -18,7 +18,14 @@ from config.loader import load_config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-MAX_WORKERS = 2
+def download_workers(cfg):
+    """Number of parallel downloads (data_acquisition.download_workers)."""
+    n = (cfg.get("data_acquisition") or {}).get("download_workers")
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise ValueError(f"data_acquisition.download_workers in config.yaml must be "
+                         f"an integer >= 1, got {n!r}")
+    return n
+
 
 def _s3_prefix(cfg):
     rs = cfg["resstock"]
@@ -30,8 +37,9 @@ def _s3_prefix(cfg):
     )
 
 
-def _s3_client():
-    return boto3.client("s3", config=Config(signature_version=UNSIGNED))
+def _s3_client(max_connections=10):
+    return boto3.client("s3", config=Config(signature_version=UNSIGNED,
+                                            max_pool_connections=max_connections))
 
 
 def building_id_file(cfg):
@@ -105,44 +113,57 @@ def download_building_files(cfg, building_ids=None):
     else:
         building_ids = apply_test_limit(cfg, building_ids)
 
-    s3 = _s3_client()
+    s3 = _s3_client(download_workers(cfg))
     bucket = cfg["resstock"]["s3_bucket"]
     prefix = _s3_prefix(cfg)
     state = cfg["state"]
     output_dir = cfg["paths"]["input_dir"] / "residential_profiles" / state
     output_dir.mkdir(parents=True, exist_ok=True)
+    failed_file = output_dir / "failed_downloads.csv"
+
+    to_download = [b for b in building_ids
+                   if not (output_dir / f"{b}-0.parquet").exists()]
+    skipped = len(building_ids) - len(to_download)
+    workers = download_workers(cfg)
+    log.info(f"Downloading {len(to_download)} buildings to {output_dir} "
+             f"({skipped} already present, {workers} parallel downloads)")
+
+    def _fetch(bldg_id):
+        # download_file writes to a temporary name and renames it when
+        # complete, so an interrupted download never leaves a partial file
+        s3.download_file(bucket, f"{prefix}{bldg_id}-0.parquet",
+                         str(output_dir / f"{bldg_id}-0.parquet"))
 
     downloaded = 0
-    skipped = 0
     failed = []
+    t_start = time.time()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_fetch, b): b for b in to_download}
+        for future in as_completed(futures):
+            bldg_id = futures[future]
+            try:
+                future.result()
+                downloaded += 1
+            except Exception as e:
+                log.warning(f"Failed: {bldg_id} ({e})")
+                failed.append((bldg_id, str(e)))
+            done = downloaded + len(failed)
+            if done % 500 == 0:
+                rate = done / (time.time() - t_start)
+                log.info(f"  {done}/{len(to_download)} ({rate:.1f}/s, "
+                         f"~{(len(to_download) - done) / rate / 60:.0f} min left)")
 
-    log.info(f"Downloading {len(building_ids)} buildings to {output_dir}")
-
-    for bldg_id in building_ids:
-        local_path = output_dir / f"{bldg_id}-0.parquet"
-
-        if local_path.exists():
-            skipped += 1
-            continue
-
-        key = f"{prefix}{bldg_id}-0.parquet"
-        try:
-            s3.download_file(bucket, key, str(local_path))
-            downloaded += 1
-            if downloaded % 50 == 0:
-                log.info(f"  downloaded {downloaded} so far...")
-        except Exception as e:
-            log.warning(f"Failed: {bldg_id} ({e})")
-            failed.append(bldg_id)
-
-    log.info(f"Done. downloaded={downloaded}, skipped={skipped}, failed={len(failed)}")
+    log.info(f"Done. downloaded={downloaded}, skipped={skipped}, failed={len(failed)} "
+             f"({time.time() - t_start:.0f}s)")
 
     if failed:
-        failed_file = output_dir / "failed_downloads.csv"
-        pd.DataFrame({"bldg_id": failed}).to_csv(failed_file, index=False)
-        log.warning(f"Failed IDs saved to {failed_file}")
+        pd.DataFrame(failed, columns=["bldg_id", "error"]).to_csv(failed_file, index=False)
+        raise RuntimeError(
+            f"{len(failed)} building profile(s) failed to download (list: {failed_file}). "
+            f"Re-run data acquisition to retry; finished files are skipped.")
+    failed_file.unlink(missing_ok=True)
 
-    return {"downloaded": downloaded, "skipped": skipped, "failed": failed}
+    return {"downloaded": downloaded, "skipped": skipped, "failed": []}
 
 
 def _metadata_s3_key(cfg, fmt):
@@ -285,7 +306,7 @@ def download_network(cfg):
     skipped. scope: zone -> zone.name only; statewide -> every zone."""
     from process_network_info import select_zones
 
-    s3 = _s3_client()
+    s3 = _s3_client(download_workers(cfg))
     bucket, prefix = _smartds_location(cfg)
     network_dir = Path(cfg["paths"]["network_dir"])
 
@@ -329,7 +350,7 @@ def download_network(cfg):
                 return f"failed: {e}"
 
         counts = {"downloaded": 0, "skipped": 0}
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=download_workers(cfg)) as executor:
             futures = {executor.submit(_fetch, k): k for k in keys}
             for future in as_completed(futures):
                 result = future.result()
@@ -388,7 +409,7 @@ def download_network_profiles(cfg, kvar_only=False):
         failed = 0
         skipped = 0
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=download_workers(cfg)) as executor:
             futures = {
                 executor.submit(_download_profile, fn, profiles_dir, base_url): fn
                 for fn in to_download
