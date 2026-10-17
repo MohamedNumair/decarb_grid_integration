@@ -9,12 +9,12 @@ for case_dir in sorted(STUDY_DECARB.iterdir()):
 
     bldgs = sorted(
         d for d in case_dir.iterdir()
-        if d.is_dir() and (d / "update_0" / "in").is_dir()
+        if d.is_dir() and (d / "in").is_dir()
     )
 
-    completed = [d for d in bldgs if (d / "update_0" / "out" / "ts.csv").exists()]
-    attempted = [d for d in bldgs if (d / "update_0" / "out").is_dir()]
-    failed = [d for d in attempted if not (d / "update_0" / "out" / "ts.csv").exists()]
+    completed = [d for d in bldgs if (d / "out" / "ts.csv").exists()]
+    attempted = [d for d in bldgs if (d / "out").is_dir()]
+    failed = [d for d in attempted if not (d / "out" / "ts.csv").exists()]
 
     print(f"{case_dir.name}: {len(completed)} ok, {len(failed)} failed, "
           f"{len(bldgs) - len(attempted)} not attempted")

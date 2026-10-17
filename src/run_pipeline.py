@@ -6,7 +6,7 @@ Pipeline phases:
 
 1. preprocess       — data acquisition through building matching
 2. decarb-inputs    — generate DECARB optimizer input files (bookend cases)
-3. (external)       — run DECARB optimizer (Julia, run_decarb.jl)
+3. (external)       — run DECARB optimizer (Julia, run_decarb_study.jl)
 4. network-inputs   — aggregate DECARB outputs into OpenDSS loadshapes
 5. opendss          — run OpenDSS power flow for each case (Julia, run_opendss.jl)
 

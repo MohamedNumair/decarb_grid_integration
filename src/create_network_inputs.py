@@ -156,28 +156,49 @@ def build_substation_lookup(building_map_df):
 # DECARB output reading
 # ---------------------------------------------------------------------------
 
-def read_decarb_ts(decarb_case_dir, bldg_id, update=0):
+ENERGY_PER_PERIOD_COLS = ("buy", "sell")
+
+
+def period_hours(decarb_case_dir, bldg_id):
+    """Length of each DECARB period [h], from the building's inputs: cfg.csv
+    pP0 and the tm.csv pP period ends (UTC)."""
+    in_dir = decarb_case_dir / str(bldg_id) / "in"
+    cfg = pd.read_csv(in_dir / "cfg.csv", header=None, index_col=0)[1]
+    ends = pd.to_datetime(pd.read_csv(in_dir / "tm.csv", usecols=["pP"])["pP"])
+    bounds = pd.concat([pd.Series([pd.to_datetime(cfg["pP0"])]), ends], ignore_index=True)
+    return bounds.diff().dropna().dt.total_seconds().to_numpy() / 3600
+
+
+def read_decarb_ts(decarb_case_dir, bldg_id):
     """Read DECARB optimizer output timeseries for a building.
 
     The DECARB optimizer writes ts.csv with columns like:
-    buy, sell, HVACht, HVACac, CHPht, etc.
+    buy, sell, hvac_HT, hvac_AC, pv, etc. All are average kW per period except
+    buy and sell, which DECARB writes as kWh per period; they are converted to
+    kW here (no change for hourly periods).
     """
-    ts_path = (decarb_case_dir / str(bldg_id) / f"update_{update}" / "out" / "ts.csv")
+    ts_path = decarb_case_dir / str(bldg_id) / "out" / "ts.csv"
     if not ts_path.exists():
         return None
     try:
         df = pd.read_csv(str(ts_path))
-        if df.empty:
-            return None
-        return df
     except Exception:
         return None
+    if df.empty:
+        return None
+    hours = period_hours(decarb_case_dir, bldg_id)
+    if len(hours) != len(df):
+        raise ValueError(f"{ts_path}: {len(df)} rows but {len(hours)} periods in its tm.csv")
+    for col in ENERGY_PER_PERIOD_COLS:
+        if col in df.columns:
+            df[col] = df[col] / hours
+    return df
 
 
-def read_decarb_tm(decarb_case_dir, bldg_id, update=0):
+def read_decarb_tm(decarb_case_dir, bldg_id):
     """Read the DECARB input tm.csv to get consumption data when
     DECARB outputs aren't available yet (pre-optimization)."""
-    tm_path = (decarb_case_dir / str(bldg_id) / f"update_{update}" / "in" / "tm.csv")
+    tm_path = decarb_case_dir / str(bldg_id) / "in" / "tm.csv"
     if not tm_path.exists():
         return None
     return pd.read_csv(str(tm_path), index_col=0)
@@ -191,7 +212,7 @@ SUMMER_DEMAND_TAG = "out.qoi.electricity.maximum_daily_peak_summer..kw"
 WINTER_DEMAND_TAG = "out.qoi.electricity.maximum_daily_peak_winter..kw"
 
 
-def build_substitution_map(decarb_case_dir, building_ids, cfg, update=0):
+def build_substitution_map(decarb_case_dir, building_ids, cfg):
     """For each failed building, find the closest successful building
     by peak demand (summer, winter) and return a substitution map.
 
@@ -206,7 +227,7 @@ def build_substitution_map(decarb_case_dir, building_ids, cfg, update=0):
     failed = []
     for bldg_id in building_ids:
         bldg_id = int(bldg_id)
-        ts_path = decarb_case_dir / str(bldg_id) / f"update_{update}" / "out" / "ts.csv"
+        ts_path = decarb_case_dir / str(bldg_id) / "out" / "ts.csv"
         if ts_path.exists():
             successful.append(bldg_id)
         else:
@@ -280,7 +301,7 @@ def to_hourly(series_15min):
 
 
 def aggregate_demand_1bus(decarb_case_dir, building_map_df, n_hours=8760,
-                          sub_map=None, update=0, hour_indices=None):
+                          sub_map=None, hour_indices=None):
     """Aggregate building-level electricity purchases into a single
     system-wide demand profile (MW) for 1-bus GenX mode.
 
@@ -301,13 +322,13 @@ def aggregate_demand_1bus(decarb_case_dir, building_map_df, n_hours=8760,
 
     for bldg_id, count in bldg_counts.items():
         bldg_id = int(bldg_id)
-        ts_df = read_decarb_ts(decarb_case_dir, bldg_id, update=update)
+        ts_df = read_decarb_ts(decarb_case_dir, bldg_id)
 
         if ts_df is None or "buy" not in ts_df.columns:
             # Try substitution
             sub_id = sub_map.get(bldg_id)
             if sub_id is not None:
-                ts_df = read_decarb_ts(decarb_case_dir, sub_id, update=update)
+                ts_df = read_decarb_ts(decarb_case_dir, sub_id)
                 if ts_df is not None and "buy" in ts_df.columns:
                     substituted += 1
                 else:
@@ -344,7 +365,7 @@ def aggregate_demand_1bus(decarb_case_dir, building_map_df, n_hours=8760,
 
 def aggregate_demand_multibus(decarb_case_dir, substation_lookup,
                               bus_mapping_df=None, n_hours=8760,
-                              sub_map=None, update=0, hour_indices=None):
+                              sub_map=None, hour_indices=None):
     """Aggregate building-level demand per substation (or per bus zone).
 
     Returns a dict of {column_name: demand_array_MW}.
@@ -368,12 +389,12 @@ def aggregate_demand_multibus(decarb_case_dir, substation_lookup,
 
         for bldg_id_str, count in bldg_counts.items():
             bldg_id = int(bldg_id_str)
-            ts_df = read_decarb_ts(decarb_case_dir, bldg_id, update=update)
+            ts_df = read_decarb_ts(decarb_case_dir, bldg_id)
 
             if ts_df is None or "buy" not in ts_df.columns:
                 sub_id_sub = sub_map.get(bldg_id)
                 if sub_id_sub is not None:
-                    ts_df = read_decarb_ts(decarb_case_dir, sub_id_sub, update=update)
+                    ts_df = read_decarb_ts(decarb_case_dir, sub_id_sub)
                 if ts_df is None or "buy" not in ts_df.columns:
                     continue
 
@@ -485,7 +506,7 @@ def study_timestep(study_dir):
         path = Path(study_dir) / name
         if not path.exists():
             return None
-        with open(path) as f:
+        with open(path, encoding="utf-8-sig") as f:   # tolerate a BOM
             return (yaml.safe_load(f) or {}).get("timestep")
 
     for name in ("config.yaml", "decarb.yaml"):
@@ -522,7 +543,7 @@ def select_period(values, step_indices, n_full_year, label):
                      f"for this study's timestep")
 
 
-def classify_heating_pf(decarb_case_dir, bldg_id, update=0):
+def classify_heating_pf(decarb_case_dir, bldg_id):
     """Determine whether the building's electric heating is compressor-driven
     (heat pump → lagging PF) or resistive (baseboard/furnace → PF=1.0).
 
@@ -530,8 +551,8 @@ def classify_heating_pf(decarb_case_dir, bldg_id, update=0):
     to see if it has both heating and cooling capacity (heat pump) or
     heating-only with no compressor cooling (resistive).
     """
-    sp_path = decarb_case_dir / str(bldg_id) / f"update_{update}" / "in" / "sp.csv"
-    hvac_path = decarb_case_dir / str(bldg_id) / f"update_{update}" / "in" / "hvac.csv"
+    sp_path = decarb_case_dir / str(bldg_id) / "in" / "sp.csv"
+    hvac_path = decarb_case_dir / str(bldg_id) / "in" / "hvac.csv"
 
     try:
         sp_df = pd.read_csv(str(sp_path))
@@ -573,7 +594,7 @@ def compute_kvar_curve(ts_df, pf_ht):
 
 def generate_opendss_loadshapes(decarb_case_dir, building_map_df,
                                 network_dir, zone_name, output_dir, ncfg,
-                                sub_map=None, update=0, timestep="hourly",
+                                sub_map=None, timestep="hourly",
                                 step_indices=None):
     """Build complete OpenDSS case directories from DECARB outputs.
 
@@ -625,13 +646,13 @@ def generate_opendss_loadshapes(decarb_case_dir, building_map_df,
     for bldg_id in unique_bldgs:
         bldg_id = int(bldg_id)
         source_id = bldg_id  # which building's DECARB output to read
-        ts_df = read_decarb_ts(decarb_case_dir, bldg_id, update=update)
+        ts_df = read_decarb_ts(decarb_case_dir, bldg_id)
 
         if ts_df is None or not {"buy", "sell", "dem", "hvac_HT", "hvac_AC", "pv"}.issubset(ts_df.columns):
             # Try substitution
             sub_id = sub_map.get(bldg_id)
             if sub_id is not None:
-                ts_df = read_decarb_ts(decarb_case_dir, sub_id, update=update)
+                ts_df = read_decarb_ts(decarb_case_dir, sub_id)
                 if ts_df is not None and {"buy", "sell", "dem", "hvac_HT", "hvac_AC", "pv"}.issubset(ts_df.columns):
                     source_id = sub_id
                     substituted += 1
@@ -642,7 +663,7 @@ def generate_opendss_loadshapes(decarb_case_dir, building_map_df,
                 skipped += 1
                 continue
 
-        pf_ht = classify_heating_pf(decarb_case_dir, source_id, update=update)
+        pf_ht = classify_heating_pf(decarb_case_dir, source_id)
         pf_ht_cache[bldg_id] = pf_ht
 
         net_kw = (ts_df["buy"].values - ts_df["sell"].values)
@@ -784,7 +805,7 @@ def find_study_dir(output_dir, study_num=None):
     return study_dirs[-1]
 
 
-def run_network_inputs(cfg, ncfg=None, study_num=None, update=0):
+def run_network_inputs(cfg, ncfg=None, study_num=None):
     if ncfg is None:
         ncfg = load_network_config()
 
@@ -818,9 +839,18 @@ def run_network_inputs(cfg, ncfg=None, study_num=None, update=0):
         return
     log.info(f"Found {len(decarb_cases)} DECARB cases: {decarb_cases}")
 
+    # Studies made before the update_N level was removed keep each building's
+    # files in {bldg_id}/update_0/; they are not supported.
+    first_case = decarb_root / decarb_cases[0]
+    if any((d / "update_0").is_dir() for d in first_case.iterdir() if d.is_dir()):
+        raise ValueError(
+            f"{study_dir.name} uses the old layout ({{bldg_id}}/update_0/in, out). "
+            f"The pipeline now expects {{bldg_id}}/in and {{bldg_id}}/out; "
+            f"regenerate the study with decarb-inputs.")
+
     if scope == "statewide":
         _run_genx(cfg, study_dir, decarb_root, decarb_cases,
-                  building_map_df, ncfg, update=update)
+                  building_map_df, ncfg)
     elif scope == "zone":
         zone_name = cfg["zone"]["name"]
         if not zone_name:
@@ -843,7 +873,7 @@ def run_network_inputs(cfg, ncfg=None, study_num=None, update=0):
                     f"but zone.name in config.yaml is {zone_name!r}. Set zone.name to the "
                     f"study's zone, or use a study made for {zone_name}.")
         _run_opendss(cfg, study_dir, decarb_root, decarb_cases,
-                     feeder_df, network_dir, zone_name, ncfg, update=update)
+                     feeder_df, network_dir, zone_name, ncfg)
     else:
         log.error(f"Unknown scope: {scope}")
 
@@ -856,8 +886,7 @@ def _copy_base_case(base_case_dir, genx_case_dir):
     log.info(f"Copied base case from {base_case_dir}")
 
 
-def _run_genx(cfg, study_dir, decarb_root, decarb_cases, building_map_df, ncfg,
-              update=0):
+def _run_genx(cfg, study_dir, decarb_root, decarb_cases, building_map_df, ncfg):
     genx_cfg = ncfg["genx"]
     network_mode = genx_cfg.get("network_mode", "1bus")
     hour_indices = resolve_hour_indices(cfg)
@@ -880,18 +909,16 @@ def _run_genx(cfg, study_dir, decarb_root, decarb_cases, building_map_df, ncfg,
         substation_lookup = build_substation_lookup(building_map_df)
 
     all_bldg_ids = building_map_df["bldg_id"].unique().tolist()
-    update_suffix = f"_update_{update}" if update != 0 else ""
     genx_root = study_dir / "genx"
 
     for case_name in decarb_cases:
         decarb_case_dir = decarb_root / case_name
-        genx_case_dir = genx_root / f"{case_name}{update_suffix}"
+        genx_case_dir = genx_root / case_name
 
-        log.info(f"GenX case: {case_name} (update_{update})")
+        log.info(f"GenX case: {case_name}")
 
         # Build substitution map for failed buildings
-        sub_map = build_substitution_map(decarb_case_dir, all_bldg_ids, cfg,
-                                         update=update)
+        sub_map = build_substitution_map(decarb_case_dir, all_bldg_ids, cfg)
 
         # Copy supply-side base case, then overwrite demand
         if base_case_dir:
@@ -902,19 +929,18 @@ def _run_genx(cfg, study_dir, decarb_root, decarb_cases, building_map_df, ncfg,
         if network_mode == "1bus":
             demand = aggregate_demand_1bus(
                 decarb_case_dir, building_map_df, n_hours,
-                sub_map=sub_map, update=update, hour_indices=hour_indices)
+                sub_map=sub_map, hour_indices=hour_indices)
         else:
             demand = aggregate_demand_multibus(
                 decarb_case_dir, substation_lookup,
                 bus_mapping_df, n_hours,
-                sub_map=sub_map, update=update, hour_indices=hour_indices)
+                sub_map=sub_map, hour_indices=hour_indices)
 
         write_genx_demand(demand, genx_case_dir, ncfg)
 
 
 def _run_opendss(cfg, study_dir, decarb_root, decarb_cases,
-                 feeder_df, network_dir, zone_name, ncfg, update=0):
-    update_suffix = f"_update_{update}" if update != 0 else ""
+                 feeder_df, network_dir, zone_name, ncfg):
     opendss_root = study_dir / "opendss"
     timestep = study_timestep(study_dir)
     step_indices = resolve_step_indices(cfg, STEPS_PER_HOUR[timestep])
@@ -928,28 +954,25 @@ def _run_opendss(cfg, study_dir, decarb_root, decarb_cases,
 
     for case_name in decarb_cases:
         decarb_case_dir = decarb_root / case_name
-        opendss_case_dir = opendss_root / f"{case_name}{update_suffix}"
+        opendss_case_dir = opendss_root / case_name
 
-        log.info(f"OpenDSS case: {case_name} (update_{update})")
+        log.info(f"OpenDSS case: {case_name}")
 
         # Build substitution map for failed buildings
-        sub_map = build_substitution_map(decarb_case_dir, all_bldg_ids, cfg,
-                                         update=update)
+        sub_map = build_substitution_map(decarb_case_dir, all_bldg_ids, cfg)
 
         generate_opendss_loadshapes(
             decarb_case_dir, feeder_df,
             network_dir, zone_name, opendss_case_dir, ncfg,
-            sub_map=sub_map, update=update, timestep=timestep,
+            sub_map=sub_map, timestep=timestep,
             step_indices=step_indices)
 
 
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Generate network inputs from DECARB results")
-    ap.add_argument("--update", type=int, default=0,
-                    help="DECARB update number to read from (default: 0)")
     args = ap.parse_args()
 
     cfg = load_config()
     ncfg = load_network_config()
-    run_network_inputs(cfg, ncfg, update=args.update)
+    run_network_inputs(cfg, ncfg)

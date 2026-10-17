@@ -224,8 +224,6 @@ def main():
     parser = argparse.ArgumentParser(description="OpenDSS Study Runner")
     parser.add_argument("--study", type=int, default=None, help="Study number (default: latest)")
     parser.add_argument("--workers", type=int, default=20, help="Number of parallel workers")
-    parser.add_argument("--update", type=int, default=0,
-                        help="DECARB update number to run (default: 0)")
     args = parser.parse_args()
 
     # When started by run_pipeline.py, also write to that run's log file
@@ -243,13 +241,8 @@ def main():
     if not opendss_root.exists():
         log.error(f"No opendss directory in study: {opendss_root}")
         return
-    all_case_dirs = sorted([d.name for d in opendss_root.iterdir() if d.is_dir()])
-    update_suffix = f"_update_{args.update}" if args.update != 0 else ""
-    if args.update == 0:
-        cases = [c for c in all_case_dirs if "_update_" not in c]
-    else:
-        cases = [c for c in all_case_dirs if c.endswith(update_suffix)]
-    log.info(f"Found {len(cases)} cases for update_{args.update}")
+    cases = sorted([d.name for d in opendss_root.iterdir() if d.is_dir()])
+    log.info(f"Found {len(cases)} cases")
 
     # Results directory
     results_root = study_dir / "opendss_results"

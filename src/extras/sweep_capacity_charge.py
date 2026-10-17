@@ -73,8 +73,8 @@ def copy_building_dir(src_case_dir, dst_case_dir, bldg_id):
     This avoids copying ~1.2 MB tm.csv × 10 cases redundantly — only the one
     we need to modify gets a real copy.
     """
-    src = src_case_dir / str(bldg_id) / "update_0" / "in"
-    dst = dst_case_dir / str(bldg_id) / "update_0" / "in"
+    src = src_case_dir / str(bldg_id) / "in"
+    dst = dst_case_dir / str(bldg_id) / "in"
 
     if not src.exists():
         return False
@@ -97,7 +97,7 @@ def copy_building_dir(src_case_dir, dst_case_dir, bldg_id):
 
 def patch_tm_capacity_charge(case_dir, bldg_id, cc_value):
     """Set pQmx=1 and pQmxCost=cc_value in a building's tm.csv."""
-    tm_path = case_dir / str(bldg_id) / "update_0" / "in" / "tm.csv"
+    tm_path = case_dir / str(bldg_id) / "in" / "tm.csv"
     if not tm_path.exists():
         return False
 

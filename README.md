@@ -18,7 +18,7 @@ The zone workflow (`scope: "zone"`, OpenDSS) is the maintained path. The statewi
 pip install -r requirements.txt
 ```
 
-**Julia + DECARB** (only for the DECARB optimizer step): DECARB itself, Gurobi, and the Julia packages `CSV`, `DataFrames`, `Dates`, `Distributed`.
+**Julia + DECARB** (only for the DECARB optimizer step): Julia 1.10+ and the DECARB repository, with its environment instantiated (`julia --project=<DECARB folder> -e "using Pkg; Pkg.instantiate()"`). Gurobi needs a license; HiGHS is free and installed with DECARB.
 
 ## 2. Input data
 
@@ -36,7 +36,8 @@ Provided by you:
 |---|---|---|
 | NEEP heat pump database | NEEP cold-climate ASHP product list export (CSV or Excel). Must include the `Brand Name`, `Status`, `HSPF (Region IV)` and the rated/min/max capacity and COP columns at 5/17/47/82/95 °F | `in/neep_database.csv`, or set `heatpump.neep_database` |
 | County shapefile | County polygons for the network's state, with fields `name`, `statefp`, `countyfp` (e.g. the OpenDataSoft "US County Boundaries" export) | `paths.county_shapefile` |
-| DECARB input templates | `bdg_i.csv`, `in.csv`, `abs.csv`, `pv.csv`, `bess.csv`, `wind.csv`, `ev.csv`, `chp.csv`, `topo.csv`, `hvac.csv`, `wh.csv`, `sp.csv` | `template_dir` in `decarb.yaml` (default `in/decarb_input_templates/`) |
+
+Included in the repo: the DECARB input templates (`in/decarb_templates/`, `template_dir` in `decarb.yaml`). Their equipment costs and efficiencies are model inputs; see [docs/modeling_notes.md](docs/modeling_notes.md) section 4.
 
 The building state and the network do not have to match. For example, NY or MA buildings on Texas feeders is a normal setup.
 
@@ -52,7 +53,7 @@ Settings a new user usually changes:
 
 ```yaml
 state: "NY"                   # ResStock state of the buildings
-timezone: "America/New_York"  # time zone of the buildings (PV orientation)
+timezone: "America/New_York"  # time zone of the buildings (TOU peak hours, DECARB output dates)
 zone: {name: "P101U"}         # SMART-DS zone (feeder network) to use
 paths:
   network_dir: "../in/smartds"  # on Windows keep the project path short (260-character path limit)
@@ -94,13 +95,13 @@ python src/run_pipeline.py decarb-inputs
 ```
 
 - Checks every required file first, and lists any building with missing inputs in `out/decarb_inputs_missing_files.csv`. Then it asks for a short study description and creates `out/studies/study_N/`.
-- Writes `decarb/{tariff}_heat_{0|100}_solar_{0|100}/{bldg_id}/update_0/in/` for every matched building, plus copies of the three config files and the matching file.
-- The thermal coefficients in `bdg_ii.csv` are converted from the 15-min fit to the DECARB `timestep`.
+- Writes `decarb/{tariff}_heat_{0|100}_solar_{0|100}/{bldg_id}/in/` for every matched building, plus copies of the three config files and the matching file.
+- The thermal coefficients in `bdg_ii.csv` are written as fitted (15-min), with `pBtime = 0.25`; DECARB converts them to its own step length.
 - `date_range` in `config.yaml` limits `tm.csv` to that period. Preprocessing always uses the full year.
 
 ### 4.3 Run DECARB
 
-Outside this Python pipeline: edit the settings block at the top of `src/run_decarb_study.jl` (`STUDY_DIR`, `DECARB_SRC`, `N_WORKERS`) and run it with Julia. DECARB writes `update_0/out/ts.csv` for each building.
+Outside this Python pipeline: edit the settings block at the top of `src/run_decarb_study.jl` (`STUDY_DIR`, `DECARB_DIR`, `N_WORKERS`, `SOLVER`, `GUROBI_LICENSE`) and run it with Julia. It loads the DECARB package from `DECARB_DIR` and solves with Gurobi (or the free HiGHS) at a 1% MIP gap and 300 s per building. DECARB writes `{bldg_id}/out/ts.csv` for each building; failures go to `failed_buildings.csv` in the case folder.
 
 ### 4.4 Network inputs
 
@@ -131,7 +132,14 @@ The OpenDSS runner reads each case's step size and length from its `Master.dss`,
 
 DECARB runs only the 0% and 100% bookends of each dimension (electrification, solar). For an intermediate level, a seeded random set of buildings, weighted by how many loads each represents, takes its 100% profile and the rest keep their 0% profile. The sum is the zone demand at that level. Output: `out/studies/study_N/interpolation_summary.csv`.
 
-## 7. Folder layout
+## 7. Modeling notes
+
+[docs/modeling_notes.md](docs/modeling_notes.md) explains where the values
+handed to DECARB come from and why they differ from the raw data: ResStock
+timestamp convention, thermal coefficient timestep, heat pump capacity
+derating, and the DECARB templates.
+
+## 8. Folder layout
 
 ```
 config/                     config.yaml, decarb.yaml, network.yaml

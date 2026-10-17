@@ -1,7 +1,8 @@
 .env
 __pycache__/
 *.pyc
-in/
+in/*
+!in/decarb_templates/
 out/
 *.parquet
 *.7z

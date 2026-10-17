@@ -44,8 +44,8 @@ test_limit: 600              # max buildings in the candidate pool (ignored when
 state: "NY"
 state_full: "New York"
 year: 2018
-timezone: "America/New_York"  # IANA time zone of the buildings' timestamps; used for the
-                              # solar position when sizing rooftop PV orientation
+timezone: "America/New_York"  # IANA time zone of the buildings: local clock for TOU peak
+                              # hours and DECARB output dates (pBtz)
                               # (e.g. "America/Chicago" for TX, "America/New_York" for MA)
 
 # --- Paths (relative to this config file's directory) ---

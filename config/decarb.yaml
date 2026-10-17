@@ -83,8 +83,8 @@ outputs:
   tm: true                  # tm.csv — timeseries model (tariff, weather, loads)
   bdg_i: true               # bdg_i.csv — building envelope parameters
   bdg_ii: true              # bdg_ii.csv — thermal model regression coefficients
-  in: true                  # in.csv — initial conditions
-  other: true               # abs.csv, pv.csv, bess.csv, wind.csv, ev.csv
+  cfg: true                 # cfg.csv — run settings and initial conditions (pP0, pTin0); written with tm.csv
+  other: true               # abp.csv, pv.csv, bess.csv, wind.csv, ev.csv
   chp: true                 # chp.csv — combined heat & power / boiler options
   topo: true                # topo.csv — energy system topology
   hvac: true                # hvac.csv — HVAC system options
@@ -93,7 +93,7 @@ outputs:
 
 # --- Template Directory ---
 # Path to DECARB CSV templates (relative to this config file)
-template_dir: "../in/decarb_input_templates"
+template_dir: "../in/decarb_templates"
 
 # --- Workers ---
 max_workers: 4              # parallel processes for batch generation

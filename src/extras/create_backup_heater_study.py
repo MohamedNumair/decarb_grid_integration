@@ -2,14 +2,15 @@
 Create a backup-heater study from an existing DECARB case.
 
 Takes a base study's single case (e.g. study_8/decarb/flat_cap_heat_0_solar_0)
-and creates a new study with three updates per building:
+and creates a new study with three cases, each with every building:
 
-  update_0  As-is building (copied verbatim from source)
-  update_1  ASHP replaces legacy HVAC, fossil heater removed (pCHPz0=0),
-            fossil fuel prices set to electricity + margin
-  update_2  ASHP replaces legacy HVAC, fossil heater kept as backup
-            at BACKUP_FRACTION of ASHP heating capacity,
-            fossil fuel prices set to electricity + margin
+  {case}                   As-is building (copied from source),
+                           fossil fuel prices set to electricity + margin
+  {case}_ashp_no_backup    ASHP replaces legacy HVAC, fossil heater removed (pCHPz0=0),
+                           fossil fuel prices set to electricity + margin
+  {case}_ashp_backup       ASHP replaces legacy HVAC, fossil heater kept as backup
+                           at BACKUP_FRACTION of ASHP heating capacity,
+                           fossil fuel prices set to electricity + margin
 
 Usage:
     python create_backup_heater_study.py --source-study 8 --case flat_cap_heat_0_solar_0
@@ -118,29 +119,29 @@ def patch_tm_fuel_prices(tm_path: Path, margin: float):
     tm.to_csv(tm_path, index=False)
 
 
-def create_update(src_in: Path, dst_update: Path, keep_backup: bool,
-                  fraction: float, fuel_margin: float) -> str:
-    if dst_update.exists():
-        shutil.rmtree(dst_update)
+def create_ashp_building(src_in: Path, dst_bldg: Path, keep_backup: bool,
+                         fraction: float, fuel_margin: float) -> str:
+    if dst_bldg.exists():
+        shutil.rmtree(dst_bldg)
 
-    shutil.copytree(str(src_in), str(dst_update / "in"))
-    (dst_update / "out").mkdir()
+    shutil.copytree(str(src_in), str(dst_bldg / "in"))
+    (dst_bldg / "out").mkdir()
 
-    hvac = read_csv_str(dst_update / "in" / "hvac.csv")
+    hvac = read_csv_str(dst_bldg / "in" / "hvac.csv")
     ashp_name, ashp_kw = find_ashp(hvac)
 
     sp, heater_name = build_sp(
-        read_csv_str(dst_update / "in" / "sp.csv"), ashp_name, keep_backup)
-    sp.to_csv(dst_update / "in" / "sp.csv", index=False)
+        read_csv_str(dst_bldg / "in" / "sp.csv"), ashp_name, keep_backup)
+    sp.to_csv(dst_bldg / "in" / "sp.csv", index=False)
 
-    patch_tm_fuel_prices(dst_update / "in" / "tm.csv", fuel_margin)
+    patch_tm_fuel_prices(dst_bldg / "in" / "tm.csv", fuel_margin)
 
     msg = f"{ashp_name} ({ashp_kw:.2f} kW)"
     if keep_backup:
         backup_kw = fraction * ashp_kw
         chp = build_chp(
-            read_csv_str(dst_update / "in" / "chp.csv"), heater_name, backup_kw)
-        chp.to_csv(dst_update / "in" / "chp.csv", index=False)
+            read_csv_str(dst_bldg / "in" / "chp.csv"), heater_name, backup_kw)
+        chp.to_csv(dst_bldg / "in" / "chp.csv", index=False)
         msg += f" + backup {heater_name} @ {backup_kw:.2f} kW"
     else:
         msg += f", removed {heater_name}"
@@ -173,8 +174,10 @@ def main():
 
     new_num = next_study_num(output_dir)
     new_study = output_dir / "studies" / f"study_{new_num}"
-    new_case = new_study / "decarb" / args.case
-    new_case.mkdir(parents=True)
+    asis_case = new_study / "decarb" / args.case
+    ashp_cases = {f"{args.case}_ashp_no_backup": False,   # case name: keep_backup
+                  f"{args.case}_ashp_backup": True}
+    asis_case.mkdir(parents=True)
     log.info(f"Creating study_{new_num} from study_{args.source_study}/{args.case}")
 
     # Copy feeder matching if it exists
@@ -185,40 +188,39 @@ def main():
 
     bldg_dirs = sorted(
         d for d in source_case.iterdir()
-        if d.is_dir() and (d / "update_0" / "in").is_dir())
+        if d.is_dir() and (d / "in").is_dir())
 
     if not bldg_dirs:
-        log.error(f"No buildings with update_0/in found under {source_case}")
+        log.error(f"No buildings with in/ found under {source_case}")
         return 1
 
     log.info(f"Processing {len(bldg_dirs)} buildings...")
 
-    updates = {"update_1": False, "update_2": True}
     failures = 0
 
     for i, src_bldg in enumerate(bldg_dirs, 1):
         bldg_name = src_bldg.name
-        dst_bldg = new_case / bldg_name
 
-        # Copy update_0 and patch fuel prices
-        src_u0 = src_bldg / "update_0"
-        dst_u0 = dst_bldg / "update_0"
-        shutil.copytree(str(src_u0), str(dst_u0))
-        patch_tm_fuel_prices(dst_u0 / "in" / "tm.csv", args.fuel_margin)
+        # As-is case: copy the inputs only (source results used other fuel
+        # prices) and patch fuel prices
+        dst_asis = asis_case / bldg_name
+        shutil.copytree(str(src_bldg / "in"), str(dst_asis / "in"))
+        (dst_asis / "out").mkdir()
+        patch_tm_fuel_prices(dst_asis / "in" / "tm.csv", args.fuel_margin)
 
-        src_in = src_u0 / "in"
+        src_in = src_bldg / "in"
 
-        for update_name, keep_backup in updates.items():
-            dst_update = dst_bldg / update_name
+        for case_name, keep_backup in ashp_cases.items():
+            dst_bldg = new_study / "decarb" / case_name / bldg_name
             try:
-                msg = create_update(
-                    src_in, dst_update, keep_backup,
+                msg = create_ashp_building(
+                    src_in, dst_bldg, keep_backup,
                     args.fraction, args.fuel_margin)
                 if i <= 3 or i % 200 == 0:
-                    log.info(f"  {bldg_name}/{update_name}: {msg}")
+                    log.info(f"  {case_name}/{bldg_name}: {msg}")
             except Exception as exc:
                 failures += 1
-                log.warning(f"  {bldg_name}/{update_name}: ERROR {exc}")
+                log.warning(f"  {case_name}/{bldg_name}: ERROR {exc}")
 
         if i % 200 == 0:
             log.info(f"  {i}/{len(bldg_dirs)} done")

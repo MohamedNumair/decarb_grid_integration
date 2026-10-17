@@ -42,6 +42,9 @@ log = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parents[1]
 if not (PROJECT_ROOT / "config").is_dir():
     PROJECT_ROOT = Path(__file__).parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+# buy/sell converted from kWh per period to kW
+from create_network_inputs import read_decarb_ts  # noqa: E402
 
 # ── Column tags (same as building_load_matching.py) ──────────────────────
 SUMMER_DEMAND_TAG = "out.qoi.electricity.maximum_daily_peak_summer..kw"
@@ -242,22 +245,10 @@ def match_tx_to_network(feeder_df, tx_df, usage_limit="auto"):
 # Step 2: Create OpenDSS loadshapes from TX DECARB results
 # ═════════════════════════════════════════════════════════════════════════
 
-def read_decarb_ts(decarb_case_dir, bldg_id):
-    """Read DECARB ts.csv output for a building."""
-    ts_path = decarb_case_dir / str(bldg_id) / "update_0" / "out" / "ts.csv"
-    if not ts_path.exists():
-        return None
-    try:
-        df = pd.read_csv(str(ts_path))
-        return df if not df.empty else None
-    except Exception:
-        return None
-
-
 def classify_heating_pf(decarb_case_dir, bldg_id):
     """Determine if heating is compressor-driven (HP) or resistive."""
-    sp_path = decarb_case_dir / str(bldg_id) / "update_0" / "in" / "sp.csv"
-    hvac_path = decarb_case_dir / str(bldg_id) / "update_0" / "in" / "hvac.csv"
+    sp_path = decarb_case_dir / str(bldg_id) / "in" / "sp.csv"
+    hvac_path = decarb_case_dir / str(bldg_id) / "in" / "hvac.csv"
     try:
         sp_df = pd.read_csv(str(sp_path))
         hvac_df = pd.read_csv(str(hvac_path))
@@ -296,7 +287,7 @@ def build_substitution_map(decarb_case_dir, building_ids, tx_meta):
     """
     def _check_exists(bldg_id):
         bldg_id = int(bldg_id)
-        ts_path = decarb_case_dir / str(bldg_id) / "update_0" / "out" / "ts.csv"
+        ts_path = decarb_case_dir / str(bldg_id) / "out" / "ts.csv"
         return bldg_id, ts_path.exists()
 
     successful = []

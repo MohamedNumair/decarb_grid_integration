@@ -463,12 +463,12 @@ def run_sweep(cfg, source_study_dir, percentiles, elec_pct, pv_pct):
                     skipped += 1
                     continue
 
-                src_in = src_case / str(bldg_id) / "update_0" / "in"
+                src_in = src_case / str(bldg_id) / "in"
                 if not src_in.exists():
                     skipped += 1
                     continue
 
-                dst_in = case_dir / str(bldg_id) / "update_0" / "in"
+                dst_in = case_dir / str(bldg_id) / "in"
                 dst_in.mkdir(parents=True, exist_ok=True)
 
                 # Copy files from bookend. For electrified buildings,

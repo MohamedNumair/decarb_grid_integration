@@ -12,7 +12,9 @@ from scipy.optimize import lsq_linear
 from scipy import stats as scipy_stats
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from config.loader import load_config
+from config.loader import load_config, load_decarb_config
+from internal_gains import (OCCUPANT_SCHEDULE_COL, OCCUPANTS_META_COL, equipment_kwh,
+                            lighting_kwh, occupant_count)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -39,14 +41,20 @@ WIND_COL     = "out.weather.wind_speed..meter_per_second"
 HUMIDITY_COL = "out.outdoor_air_relative_humidity..percentage"
 OUTDOOR_TEMP_COL = "out.outdoor_air_drybulb_temp..c"
 
-LIGHTING_COL  = "out.electricity.lighting_interior.energy_consumption..kwh"
-EQUIPMENT_COL = "out.electricity.plug_loads.energy_consumption..kwh"
-DHW_COL       = "out.load.hot_water.energy_delivered..kbtu"
-PEOPLE_COL    = "out.people.total_heating_rate..watt"
+# Internal gains are DECARB's own (internal_gains.py): electric lighting and
+# equipment as written to tm.csv, and occupants, scaled by the bdg_i.csv
+# template's pBihgl / pBihge / pBihgp. Hot water gains are not included.
 
-LIGHTING_FRACTION  = 1.0
-EQUIPMENT_FRACTION = 1.0
-DHW_FRACTION       = 0
+
+def decarb_gain_factors():
+    """pBihgp [kW/person], pBihgl, pBihge from the DECARB bdg_i.csv template."""
+    path = load_decarb_config()["template_dir"] / "bdg_i.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"DECARB template not found: {path} (template_dir in decarb.yaml); "
+                                f"the thermal model uses its internal-gain factors")
+    t = pd.read_csv(path, header=None, index_col=0)[1]
+    return {"people_kw": float(t["pBihgp"]), "lighting": float(t["pBihgl"]),
+            "equipment": float(t["pBihge"])}
 
 THERMAL_FEATURE_SET = "baseline_internal_gains"
 
@@ -118,7 +126,9 @@ def create_building_timeseries(bldg_ids, cfg, save_outputs=False, skipped=None):
         raise FileNotFoundError(f"Missing ResStock metadata: {resstock_file}")
 
     resstock_df = read_parquet(resstock_file)
-    resstock_df = resstock_df[["bldg_id", "in.sqft..ft2", "in.county"]].copy()
+    if OCCUPANTS_META_COL not in resstock_df.columns:
+        raise KeyError(f"ResStock metadata has no {OCCUPANTS_META_COL} column: {resstock_file}")
+    resstock_df = resstock_df[["bldg_id", "in.sqft..ft2", "in.county", OCCUPANTS_META_COL]].copy()
     resstock_df = resstock_df.rename(columns={"in.sqft..ft2": "sqft", "in.county": "county_code"})
     resstock_df["bldg_id"] = pd.to_numeric(resstock_df["bldg_id"], errors="coerce").astype("Int64")
     resstock_df["sqm"] = resstock_df["sqft"] * 0.092903
@@ -126,11 +136,13 @@ def create_building_timeseries(bldg_ids, cfg, save_outputs=False, skipped=None):
     bldg_df = pd.DataFrame({"bldg_id": pd.array(list(bldg_ids), dtype="Int64")})
     merged_bldg_df = pd.merge(bldg_df, resstock_df, on="bldg_id", how="left", validate="m:1")
 
+    gains = decarb_gain_factors()
     all_ts_dict = {}
 
     for _, row in merged_bldg_df.iterrows():
         bldg_id = row["bldg_id"]
         sqm     = row["sqm"]
+        occupants = row[OCCUPANTS_META_COL]
 
         if pd.isna(bldg_id):
             continue
@@ -172,10 +184,14 @@ def create_building_timeseries(bldg_ids, cfg, save_outputs=False, skipped=None):
                 _skip(bldg_id, f"missing column: {SOLAR_COL}")
                 continue
 
-            has_lighting  = LIGHTING_COL  in df_cols
-            has_equipment = EQUIPMENT_COL in df_cols
-            has_dhw       = DHW_COL       in df_cols
-            has_people    = PEOPLE_COL    in df_cols
+            # Internal gains [W] (15-min kWh * 4000 = average W)
+            lighting_gain_w  = lighting_kwh(df_bldg) * 4000 * gains["lighting"]
+            equipment_gain_w = equipment_kwh(df_bldg) * 4000 * gains["equipment"]
+            if OCCUPANT_SCHEDULE_COL in df_cols and not pd.isna(occupants):
+                people = (df_bldg[OCCUPANT_SCHEDULE_COL].fillna(0) * occupant_count(occupants)).round()
+            else:
+                people = 0.0
+            people_gain_w = people * gains["people_kw"] * 1000
 
             base_cols = [
                 "datetime", OUTDOOR_TEMP_COL,
@@ -184,9 +200,7 @@ def create_building_timeseries(bldg_ids, cfg, save_outputs=False, skipped=None):
                 TS_CONFIG["heating_load_key"],
             ]
             weather_cols  = [c for c, f in [(SOLAR_COL, has_solar), (WIND_COL, has_wind), (HUMIDITY_COL, has_humidity)] if f]
-            internal_cols = [c for c, f in [(LIGHTING_COL, has_lighting), (EQUIPMENT_COL, has_equipment), (DHW_COL, has_dhw), (PEOPLE_COL, has_people)] if f]
-
-            df_bldg = df_bldg[base_cols + weather_cols + internal_cols].copy()
+            df_bldg = df_bldg[base_cols + weather_cols].copy()
 
             df_bldg.rename(columns={
                 OUTDOOR_TEMP_COL:              "outdoor_temp_c",
@@ -207,18 +221,10 @@ def create_building_timeseries(bldg_ids, cfg, save_outputs=False, skipped=None):
             if has_humidity:
                 df_bldg.rename(columns={HUMIDITY_COL: "outdoor_humidity"}, inplace=True)
 
-            df_bldg["lighting_gain_w"]  = (df_bldg[LIGHTING_COL]  * 4000 * LIGHTING_FRACTION)  if has_lighting  else 0.0
-            df_bldg["equipment_gain_w"] = (df_bldg[EQUIPMENT_COL] * 4000 * EQUIPMENT_FRACTION) if has_equipment else 0.0
-            df_bldg["dhw_gain_w"]       = (df_bldg[DHW_COL]       * 1172.284 * DHW_FRACTION)   if has_dhw       else 0.0
-
-            if has_lighting:  df_bldg.drop(columns=[LIGHTING_COL],  inplace=True)
-            if has_equipment: df_bldg.drop(columns=[EQUIPMENT_COL], inplace=True)
-            if has_dhw:       df_bldg.drop(columns=[DHW_COL],       inplace=True)
-
-            if has_people:
-                df_bldg.rename(columns={PEOPLE_COL: "people_gain_w"}, inplace=True)
-            else:
-                df_bldg["people_gain_w"] = 0.0
+            df_bldg["lighting_gain_w"]  = lighting_gain_w
+            df_bldg["equipment_gain_w"] = equipment_gain_w
+            df_bldg["dhw_gain_w"]       = 0.0
+            df_bldg["people_gain_w"]    = people_gain_w
 
         except Exception as e:
             log.warning(f"Error reading {bldg_id}-0.parquet: {e}")
@@ -417,7 +423,7 @@ def _raise_if_nothing_fitted(n_fitted, feature_name, skipped_csv):
 
 # Bump when the fitting logic changes in a way that affects the coefficients,
 # so existing results are refitted instead of reused (see stage_record.py)
-THERMAL_MODEL_VERSION = 1
+THERMAL_MODEL_VERSION = 2   # 2: internal gains = DECARB's (electric lighting/equipment, occupants)
 
 
 def thermal_stage_settings(cfg, feature_sets):
@@ -428,8 +434,7 @@ def thermal_stage_settings(cfg, feature_sets):
         "resstock_release": cfg["resstock"]["release"],
         "resstock_release_year": cfg["resstock"]["release_year"],
         "feature_sets": feature_sets,
-        "gain_fractions": {"lighting": LIGHTING_FRACTION, "equipment": EQUIPMENT_FRACTION,
-                           "dhw": DHW_FRACTION},
+        "internal_gains": decarb_gain_factors(),
     }
 
 

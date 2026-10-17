@@ -39,10 +39,10 @@ except ImportError:
     sys.path.insert(0, str(_project_root))
     from config.loader import load_config
 try:
-    from src.create_network_inputs import load_building_map
+    from src.create_network_inputs import load_building_map, read_decarb_ts
 except ImportError:
     sys.path.insert(0, str(_project_root / "src"))
-    from create_network_inputs import load_building_map
+    from create_network_inputs import load_building_map, read_decarb_ts
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -119,12 +119,9 @@ def scale_sweep(df, results_dir, dimension):
 
 
 def read_buy_profile(decarb_dir, bldg_id):
-    """Read the 'buy' column from a building's ts.csv (kW)."""
-    ts_path = decarb_dir / str(bldg_id) / "update_0" / "out" / "ts.csv"
-    if not ts_path.exists():
-        return None
-    df = pd.read_csv(ts_path, usecols=["buy"])
-    if len(df) != N_HOURS:
+    """Read the 'buy' column from a building's ts.csv, in kW."""
+    df = read_decarb_ts(decarb_dir, bldg_id)
+    if df is None or len(df) != N_HOURS:
         return None
     return df["buy"].values
 
@@ -140,7 +137,7 @@ def identify_candidates(decarb_dir, bldg_ids, dimension="heating"):
 
     candidates = []
     for bldg_id in bldg_ids:
-        sp_path = decarb_dir / str(bldg_id) / "update_0" / "in" / "sp.csv"
+        sp_path = decarb_dir / str(bldg_id) / "in" / "sp.csv"
         if not sp_path.exists():
             continue
         sp = pd.read_csv(sp_path)

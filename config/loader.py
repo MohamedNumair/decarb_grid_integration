@@ -27,7 +27,7 @@ def load_config(config_path=None):
         except ImportError:
             pass
 
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8-sig") as f:   # tolerate a BOM from Windows editors
         cfg = yaml.safe_load(f)
 
     for key in ("project_root", "input_dir", "output_dir", "network_dir", "county_shapefile"):
@@ -60,13 +60,23 @@ def load_decarb_config(config_path=None):
 
     config_dir = config_path.parent
 
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8-sig") as f:   # tolerate a BOM from Windows editors
         dcfg = yaml.safe_load(f)
 
-    template_dir = Path(dcfg.get("template_dir", "../in/decarb_input_templates"))
+    template_dir = Path(dcfg.get("template_dir", "../in/decarb_templates"))
     if not template_dir.is_absolute():
         template_dir = config_dir / template_dir
     dcfg["template_dir"] = template_dir
+
+    # outputs.in (legacy in.csv) was renamed outputs.cfg (cfg.csv)
+    outputs = dcfg.get("outputs") or {}
+    if "in" in outputs:
+        if "cfg" in outputs:
+            raise ValueError("decarb.yaml outputs has both 'in' and 'cfg'; remove 'in'")
+        import logging
+        logging.getLogger(__name__).warning(
+            "decarb.yaml outputs 'in' is deprecated; rename it to 'cfg' (cfg.csv)")
+        outputs["cfg"] = outputs.pop("in")
 
     _decarb_config = dcfg
     return dcfg
@@ -87,7 +97,7 @@ def load_network_config(config_path=None):
 
     config_dir = config_path.parent
 
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8-sig") as f:   # tolerate a BOM from Windows editors
         ncfg = yaml.safe_load(f)
 
     # Resolve relative paths in genx section

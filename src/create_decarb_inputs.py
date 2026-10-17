@@ -16,6 +16,7 @@ import pvlib
 import requests
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
+from internal_gains import equipment_kwh, lighting_kwh, occupant_count
 from config.loader import (load_config, load_decarb_config, resolve_step_indices,
                            resolve_timestep)
 
@@ -29,7 +30,7 @@ log = logging.getLogger(__name__)
 
 FT2_TO_M2 = 0.092903
 BTU_HR_TO_KW = 1 / 3412.14
-OTHER_TEMPLATE_FILES = ["abs.csv", "pv.csv", "bess.csv", "wind.csv", "ev.csv"]
+OTHER_TEMPLATE_FILES = ["abp.csv", "pv.csv", "bess.csv", "wind.csv", "ev.csv"]
 
 PV_TECH = "Tesla_Cash"
 # Texas solar: ~1700-1800 kWh per kW installed per year
@@ -110,9 +111,9 @@ def load_templates(template_dir, outputs):
     if outputs["bdg_i"]:
         templates["bdg_i"] = pd.read_csv(
             str(template_dir / "bdg_i.csv"), header=None, index_col=0)
-    if outputs["in"]:
-        templates["in"] = pd.read_csv(
-            str(template_dir / "in.csv"), header=None, index_col=0)
+    if outputs["cfg"]:
+        templates["cfg"] = pd.read_csv(
+            str(template_dir / "cfg.csv"), header=None, index_col=0)
     if outputs["other"]:
         for fname in OTHER_TEMPLATE_FILES:
             templates[fname] = pd.read_csv(
@@ -266,18 +267,16 @@ def compute_required_pv_area(panel_count, panel_area_m2):
     return (panel_count + 1) * panel_area_m2
 
 
-def compute_optimal_orientation(lat, lon, alt, tz, tm_df):
+def compute_optimal_orientation(lat, lon, alt, timestep, tm_df):
     """Optimal fixed-panel tilt/azimuth from the building's own solar resource.
 
     Ported from create_pv_sp_case.py — uses pvlib SPA solar position weighted
     by direct normal irradiance so the orientation favours hours with strong sun.
+    Solar position is taken at the start of each period (tm.csv pP are UTC
+    period ends).
     """
-    local_times = pd.to_datetime(tm_df["pP"]).dt.tz_localize(
-        tz, ambiguous="NaT", nonexistent="shift_forward"
-    )
-    valid = local_times.notna()
-    times = local_times[valid]
-    sdni = tm_df["pSdni"].to_numpy()[valid]
+    times = (pd.to_datetime(tm_df["pP"]) - TIMESTEP_LENGTH[timestep]).dt.tz_localize("UTC")
+    sdni = tm_df["pSdni"].to_numpy()
 
     solpos = pvlib.solarposition.get_solarposition(
         pd.DatetimeIndex(times), latitude=lat, longitude=lon, altitude=alt
@@ -304,11 +303,26 @@ def compute_optimal_orientation(lat, lon, alt, tz, tm_df):
 # File generators
 # ---------------------------------------------------------------------------
 
-def us_dst_start(year):
-    """Start of US daylight saving time: 2:00 on the second Sunday of March."""
-    march1 = datetime(year, 3, 1, 2, 0)
-    first_sunday = 1 + (6 - march1.weekday()) % 7
-    return march1.replace(day=first_sunday + 7)
+TIMESTEP_LENGTH = {"15min": pd.Timedelta(minutes=15), "hourly": pd.Timedelta(hours=1)}
+
+# ResStock timestamps are period ends in Eastern Standard Time (UTC-5) for
+# every state, no daylight saving. DECARB reads tm.csv timestamps as UTC
+# period ends (DECARB docs/inputs_outputs.md).
+RESSTOCK_UTC_OFFSET = pd.Timedelta(hours=5)
+
+
+def tm_utc_period_ends(year, timestep):
+    """UTC period-end timestamps for a full year of ResStock data."""
+    step = TIMESTEP_LENGTH[timestep]
+    n_steps = 8760 if timestep == "hourly" else 35040
+    return pd.date_range(start=pd.Timestamp(year, 1, 1) + step + RESSTOCK_UTC_OFFSET,
+                         periods=n_steps, freq=step)
+
+
+def local_period_starts(utc_ends, timestep, tz):
+    """Local clock time (with daylight saving) at the start of each period."""
+    starts = utc_ends - TIMESTEP_LENGTH[timestep]
+    return starts.tz_localize("UTC").tz_convert(tz).tz_localize(None)
 
 
 def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
@@ -322,20 +336,9 @@ def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
                     "in.hvac_cooling_type", "in.hvac_heating_type")
     }
 
-    if timestep == "hourly":
-        n_steps, freq = 8760, "h"
-    else:
-        n_steps, freq = 35040, "15min"
-
-    timestamps = pd.date_range(
-        start=datetime(year, 1, 1, 0, 0), periods=n_steps, freq=freq)
-    dst_spring = us_dst_start(year)
-    if dst_spring in timestamps:
-        mask = timestamps >= dst_spring
-        timestamps = pd.DatetimeIndex([
-            ts + pd.Timedelta(hours=1) if mask[i] else ts
-            for i, ts in enumerate(timestamps)
-        ])
+    timestamps = tm_utc_period_ends(year, timestep)
+    # Clock-time rules (TOU peak hours, unavailable periods) use local time
+    local = local_period_starts(timestamps, timestep, _worker_state["cfg"]["timezone"])
 
     df = pd.DataFrame(index=timestamps)
     df.index.name = "pP"
@@ -346,7 +349,7 @@ def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
     elif tariff["type"] == "tou":
         off_peak_price = tariff["rate"]
         peak_price = tariff["peak_price"]
-        ts_times = df.index.time
+        ts_times = local.time
         # Support multiple peak windows (list of {start, end} dicts)
         peak_windows = tariff.get("peak_windows", [])
         if not peak_windows and "peak_start" in tariff:
@@ -379,88 +382,17 @@ def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
     df["pGcost"] = fuel["gas"]
     df["pLcost"] = fuel["liquid"]
 
-    # Lighting
-    lighting_cols = [
-        "out.electricity.lighting_exterior.energy_consumption..kwh",
-        "out.electricity.lighting_garage.energy_consumption..kwh",
-        "out.electricity.lighting_interior.energy_consumption..kwh",
-        "out.natural_gas.lighting.energy_consumption..kwh",
-    ]
-    avail = [c for c in lighting_cols if c in consumption_df.columns]
-    if not avail:
-        raise ValueError("No lighting consumption columns found")
-    lighting_15min = consumption_df[avail].sum(axis=1)
+    # Lighting and equipment are electricity only: DECARB bills pQlight and
+    # pQequip as electricity demand. Other gas/propane/oil end uses (range,
+    # dryer, fireplace, gas lighting) are not modeled. Same definitions as the
+    # thermal model's internal gains (internal_gains.py).
+    lighting_15min = lighting_kwh(consumption_df)
     if timestep == "15min":
         df["pQlight"] = lighting_15min.values * 4
     else:
         df["pQlight"] = resample_if_needed(lighting_15min, timestep, "sum").values
 
-    # Heating consumption
-    heating_cols = [
-        "out.fuel_oil.heating.energy_consumption..kwh",
-        "out.propane.heating.energy_consumption..kwh",
-        "out.natural_gas.heating.energy_consumption..kwh",
-        "out.electricity.heating.energy_consumption..kwh",
-        "out.electricity.heating_fans_pumps.energy_consumption..kwh",
-        "out.natural_gas.heating_hp_bkup.energy_consumption..kwh",
-        "out.electricity.heating_hp_bkup.energy_consumption..kwh",
-        "out.electricity.heating_hp_bkup_fa.energy_consumption..kwh",
-    ]
-    avail = [c for c in heating_cols if c in consumption_df.columns]
-    heating_kwh = (
-        resample_if_needed(consumption_df[avail].sum(axis=1), timestep, "sum").values
-        if avail else None
-    )
-
-    # Cooling consumption
-    cooling_cols = [
-        "out.electricity.cooling.energy_consumption..kwh",
-        "out.electricity.cooling_fans_pumps.energy_consumption..kwh",
-    ]
-    avail = [c for c in cooling_cols if c in consumption_df.columns]
-    cooling_kwh = (
-        resample_if_needed(consumption_df[avail].sum(axis=1), timestep, "sum").values
-        if avail else None
-    )
-
-    # EV
-    ev_col = "out.electricity.ev_charging.energy_consumption..kwh"
-    ev_kwh = (
-        resample_if_needed(consumption_df[ev_col], timestep, "sum").values
-        if ev_col in consumption_df.columns else None
-    )
-
-    # Hot water
-    hw_cols = [
-        "out.electricity.hot_water.energy_consumption..kwh",
-        "out.electricity.hot_water_solar_th.energy_consumption..kwh",
-        "out.fuel_oil.hot_water.energy_consumption..kwh",
-        "out.natural_gas.hot_water.energy_consumption..kwh",
-        "out.propane.hot_water.energy_consumption..kwh",
-    ]
-    avail = [c for c in hw_cols if c in consumption_df.columns]
-    hw_kwh = (
-        resample_if_needed(consumption_df[avail].sum(axis=1), timestep, "sum").values
-        if avail else None
-    )
-
-    # Total energy → equipment power
-    total_cols = [
-        "out.electricity.total.energy_consumption..kwh",
-        "out.fuel_oil.total.energy_consumption..kwh",
-        "out.natural_gas.total.energy_consumption..kwh",
-        "out.propane.total.energy_consumption..kwh",
-    ]
-    avail = [c for c in total_cols if c in consumption_df.columns]
-    if not avail:
-        raise ValueError("No total energy columns found")
-    total_kwh = resample_if_needed(consumption_df[avail].sum(axis=1), timestep, "sum").values
-
-    lighting_kwh_rs = resample_if_needed(lighting_15min, timestep, "sum").values
-    equip_kwh = total_kwh.copy()
-    for part in (heating_kwh, cooling_kwh, ev_kwh, hw_kwh, lighting_kwh_rs):
-        if part is not None:
-            equip_kwh -= part
+    equip_kwh = resample_if_needed(equipment_kwh(consumption_df), timestep, "sum").values
     df["pQequip"] = equip_kwh if timestep == "hourly" else equip_kwh * 4
 
     # Outdoor temperature
@@ -500,17 +432,17 @@ def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
                 e = datetime.strptime(f"{parts[1].strip()} {year}", "%b %d %Y")
                 if e < s:
                     period_mask = (
-                        (df.index.month > s.month) |
-                        ((df.index.month == s.month) & (df.index.day >= s.day)) |
-                        (df.index.month < e.month) |
-                        ((df.index.month == e.month) & (df.index.day <= e.day))
+                        (local.month > s.month) |
+                        ((local.month == s.month) & (local.day >= s.day)) |
+                        (local.month < e.month) |
+                        ((local.month == e.month) & (local.day <= e.day))
                     )
                 else:
                     period_mask = (
-                        ((df.index.month > s.month) |
-                         ((df.index.month == s.month) & (df.index.day >= s.day))) &
-                        ((df.index.month < e.month) |
-                         ((df.index.month == e.month) & (df.index.day <= e.day)))
+                        ((local.month > s.month) |
+                         ((local.month == s.month) & (local.day >= s.day))) &
+                        ((local.month < e.month) |
+                         ((local.month == e.month) & (local.day <= e.day)))
                     )
                 season_mask = (mode_vals == mode_match) | (mode_vals == 0)
                 df.loc[period_mask & season_mask, "pTon"] = 0
@@ -574,8 +506,7 @@ def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
     if occ_sched_col in consumption_df.columns:
         occ_sched = resample_if_needed(consumption_df[occ_sched_col], timestep, "mean")
         if occ_meta_col in building_row.columns:
-            raw = str(building_row[occ_meta_col].iloc[0]).strip()
-            total = 15 if raw == "10+" else int(raw)
+            total = occupant_count(building_row[occ_meta_col].iloc[0])
             df["pBppl"] = (occ_sched.fillna(0).values * total).round().astype(int)
         else:
             df["pBppl"] = occ_sched.fillna(0).round().astype(int)
@@ -592,13 +523,7 @@ def generate_tm_data(consumption_df, setpoint_df, building_row, schedule_df,
 
 def create_tm_file(tm_df, output_dir):
     out = tm_df.copy()
-    year = _worker_state["year"]
-    formatted = out.index.strftime("%Y-%m-%dT%H:%M").tolist()
-    formatted = [
-        f"{year}-11-04T00:59" if ts == f"{year}-11-04T01:00" else ts
-        for ts in formatted
-    ]
-    out.index = formatted
+    out.index = out.index.strftime("%Y-%m-%dT%H:%M")   # UTC period ends
     out.index.name = "pP"
     out.to_csv(str(output_dir / "tm.csv"), sep=",")
 
@@ -612,6 +537,9 @@ def create_bdg_i_file(output_dir, template, building_row,
         if key in df.index:
             df.loc[key, df.columns[0]] = value
 
+    # Time zone of DECARB's output dates (tm.csv itself is UTC)
+    set_val("pBtz", _worker_state["cfg"]["timezone"])
+
     lat = float(building_row["in.weather_file_latitude"].iloc[0])
     lon = float(building_row["in.weather_file_longitude"].iloc[0])
     set_val("pBalt", elevation_cache[(lat, lon)])
@@ -620,9 +548,6 @@ def create_bdg_i_file(output_dir, template, building_row,
 
     sqft = float(building_row["in.sqft..ft2"].iloc[0])
     set_val("pBfoot", sqft * FT2_TO_M2)
-
-    insulation = str(building_row["in.insulation_slab"].iloc[0])
-    set_val("pBslab", 0 if insulation.strip().lower() == "none" else 1)
 
     wall_ft2 = float(building_row["out.params.wall_area_above_grade_exterior..ft2"].iloc[0])
     wall_per_side = (wall_ft2 * FT2_TO_M2) / 4.0
@@ -643,40 +568,45 @@ def create_bdg_i_file(output_dir, template, building_row,
     df.to_csv(str(output_dir / "bdg_i.csv"), header=False)
 
 
-TIMESTEP_FIT_STEPS = {"15min": 1, "hourly": 4}   # DECARB step length in thermal-fit steps
+TIMESTEP_FIT_STEPS = {"15min": 1, "hourly": 4}   # 15-min ResStock rows per DECARB step
+
+THERMAL_FIT_HOURS = 0.25   # the thermal model is fitted on 15-min steps
 
 
-def convert_thermal_coeffs(k1, k2, k3, n_steps):
-    """Thermal model coefficients fitted on 15-min steps, converted to a step
-    n_steps times as long (4 for hourly), by applying the 15-min model n_steps
-    times with the inputs held constant over the longer step."""
-    if n_steps == 1:
-        return k1, k2, k3
-    k1_n = 1 - (1 - k1) ** n_steps
-    gain = k1_n / k1 if k1 > 0 else n_steps   # limit of k1_n / k1 as k1 -> 0
-    return k1_n, k2 * gain, k3 * gain
-
-
-def create_bdg_ii_file(output_dir, bldg_id, regression_coeffs, timestep):
+def create_bdg_ii_file(output_dir, bldg_id, regression_coeffs):
+    """Coefficients as fitted; DECARB converts them to its step length using
+    pBtime (thermal_response_coefficients in thermal_load.jl)."""
     key = str(bldg_id)
     if key not in regression_coeffs:
         raise KeyError(f"Building {bldg_id} not found in the thermal model results")
     coeffs = regression_coeffs[key]
-    k1, k2, k3 = convert_thermal_coeffs(
-        coeffs["k1"], coeffs["k2"], coeffs["k3"], TIMESTEP_FIT_STEPS[timestep])
     pd.DataFrame([{
-        "pBk1": k1,
-        "pBk2": k2 * 1000,
-        "pBk3": k3 * 1000,
+        "pBk1": coeffs["k1"],
+        "pBk2": coeffs["k2"] * 1000,
+        "pBk3": coeffs["k3"] * 1000,
+        "pBtime": THERMAL_FIT_HOURS,
     }]).to_csv(str(output_dir / "bdg_ii.csv"), index=False)
 
 
-def create_in_file(output_dir, template, consumption_df):
+def create_cfg_file(output_dir, template, consumption_df, tm_df, timestep):
+    """cfg.csv: pP0 is the start of the first tm.csv period (tm.csv timestamps
+    are period ends), pTin0 the ResStock indoor temperature at that moment."""
     df = template.copy()
+    col = df.columns[0]
+    if "pP0" not in df.index:
+        raise KeyError("cfg.csv template has no pP0 row")
+    df.loc["pP0", col] = (tm_df.index[0] - TIMESTEP_LENGTH[timestep]).strftime("%Y-%m-%dT%H:%M")
+
     temp_col = "out.indoor_temperature.conditioned_space..c"
     if temp_col in consumption_df.columns and "pTin0" in df.index:
-        df.loc["pTin0", df.columns[0]] = consumption_df[temp_col].iloc[0]
-    df.to_csv(str(output_dir / "in.csv"), header=False)
+        # Last 15-min ResStock row before the first period; the first row
+        # when the period starts on Jan 1 (no earlier row).
+        steps_per_hour = 1 if timestep == "hourly" else 4
+        step_indices = resolve_step_indices(_worker_state["cfg"], steps_per_hour)
+        first_step = 0 if step_indices is None else int(step_indices[0])
+        row = max(first_step * TIMESTEP_FIT_STEPS[timestep] - 1, 0)
+        df.loc["pTin0", col] = consumption_df[temp_col].iloc[row]
+    df.to_csv(str(output_dir / "cfg.csv"), header=False)
 
 
 def create_other_files(output_dir, templates, has_solar=False):
@@ -707,7 +637,36 @@ def _build_chp_df(template, bldg_id, hp_summary_df, building_row=None):
     return pd.concat([df, zeros_row], ignore_index=True)
 
 
-def _build_hvac_df(template, bldg_id, hp_summary_df, building_row=None):
+def comfort_reference_temps(setpoint_df):
+    """Average comfort-band midpoint over the building's heating-mode and
+    cooling-mode periods (setpoint 'mode' 1 / -1). Falls back to the
+    all-year average for a mode the building never enters."""
+    mid = (setpoint_df["min_comfort_temp"] + setpoint_df["max_comfort_temp"]) / 2
+    refs = []
+    for mode_value in (1, -1):
+        sel = mid[setpoint_df["mode"] == mode_value]
+        refs.append(float(sel.mean()) if len(sel) else float(mid.mean()))
+    return refs[0], refs[1]
+
+
+def capacity_for_indoor_reference(capacity_kw, loss, t_design, t_indoor, mode):
+    """Re-express a capacity curve fitted against the design temperature
+    (heating: C*(1 - k*(Td - Tout)); cooling: C*(1 - k*(Tout - Td))) in
+    DECARB's form, which derates against the indoor temperature
+    (A*(1 - k'*(Tin - Tout)) / A*(1 - k'*(Tout - Tin))). Exact when the
+    indoor temperature equals t_indoor. Returns (A, k')."""
+    if mode == "heating":
+        factor = 1 + loss * (t_indoor - t_design)
+    else:
+        factor = 1 - loss * (t_indoor - t_design)
+    if factor <= 0:
+        raise ValueError(f"{mode} capacity conversion factor {factor:.3f} <= 0 "
+                         f"(loss={loss}, design={t_design}, indoor={t_indoor})")
+    return capacity_kw * factor, loss / factor
+
+
+def _build_hvac_df(template, bldg_id, hp_summary_df, building_row=None,
+                   setpoint_df=None):
     df = template.copy()
     if bldg_id not in hp_summary_df.index:
         raise ValueError(f"Building {bldg_id} not found in heat pump summary")
@@ -734,6 +693,19 @@ def _build_hvac_df(template, bldg_id, hp_summary_df, building_row=None):
     df.loc[df["pHVmx"] != 0, "pHVmx"] = heating_kw
     df.loc[df["pACmx"] != 0, "pACmx"] = cooling_kw
 
+    # The NEEP capacity fit derates from the design temperature; DECARB
+    # derates capacity from the indoor temperature. Re-express the fitted
+    # curve for each building's average heating/cooling comfort midpoint.
+    if setpoint_df is None:
+        raise ValueError(f"Building {bldg_id}: setpoint file needed to convert "
+                         f"heat pump capacity derating for DECARB")
+    t_design = float(row["design_temperature_c"].iloc[0])
+    t_heat, t_cool = comfort_reference_temps(setpoint_df)
+    hp_heating_kw, heating_loss = capacity_for_indoor_reference(
+        hp_heating_kw, float(row["heating_capacity_loss"].iloc[0]), t_design, t_heat, "heating")
+    hp_cooling_kw, cooling_loss = capacity_for_indoor_reference(
+        hp_cooling_kw, float(row["cooling_capacity_loss"].iloc[0]), t_design, t_cool, "cooling")
+
     hp_index = str(row["hp_index"].iloc[0])
     mitsubishi_row = {
         "ty": f"Mitsubishi ASHP {hp_index}",
@@ -741,9 +713,9 @@ def _build_hvac_df(template, bldg_id, hp_summary_df, building_row=None):
         "pACmx": hp_cooling_kw,
         "pHVeff": float(row["cop_heating"].iloc[0]),
         "pACeff": float(row["cop_cooling"].iloc[0]),
-        "temp": float(row["design_temperature_c"].iloc[0]),
-        "pHVmx_": float(row["heating_capacity_loss"].iloc[0]),
-        "pACmx_": float(row["cooling_capacity_loss"].iloc[0]),
+        "temp": t_design,
+        "pHVmx_": heating_loss,
+        "pACmx_": cooling_loss,
         "pHVeff_": float(row["cop_loss_heating"].iloc[0]),
         "pACeff_": float(row["cop_loss_cooling"].iloc[0]),
         "inv": float(row["capital_cost"].iloc[0]),
@@ -755,8 +727,8 @@ def _build_hvac_df(template, bldg_id, hp_summary_df, building_row=None):
 
 
 def create_hvac_file(output_dir, template, bldg_id, hp_summary_df,
-                     building_row=None):
-    df = _build_hvac_df(template, bldg_id, hp_summary_df, building_row)
+                     building_row=None, setpoint_df=None):
+    df = _build_hvac_df(template, bldg_id, hp_summary_df, building_row, setpoint_df)
     df.to_csv(str(output_dir / "hvac.csv"), index=False)
     return df
 
@@ -915,48 +887,38 @@ def create_sp_file(output_dir, template, building_row,
             df.iloc[0, df.columns.get_loc("pHVACz0")] = 1
             df.iloc[0, df.columns.get_loc("pHVACyn")] = "NO"
     else:
-        # Baseline: use the building's existing equipment
-        if heating_none:
-            pass
-        elif heating_id in hvac_df["ty"].values:
-            hvac_heating_row = hvac_df[hvac_df["ty"] == heating_id]
-            is_ashp = (not hvac_heating_row.empty and
-                       float(hvac_heating_row["pHVmx"].iloc[0]) > 0 and
-                       float(hvac_heating_row["pACmx"].iloc[0]) > 0)
-            if heating_id in df["pHVAC0"].values:
-                df.loc[df["pHVAC0"] == heating_id, "pHVACz0"] = 1
-            else:
-                df.iloc[0, df.columns.get_loc("pHVAC0")] = heating_id
-                df.iloc[0, df.columns.get_loc("pHVACz0")] = 1
-            if not is_ashp and not cooling_none and not cooling_ducted_hp:
-                if cooling_id in df["pHVAC0"].values:
-                    df.loc[df["pHVAC0"] == cooling_id, "pHVACz0"] = 1
+        # Baseline: the building's existing equipment. Heating and cooling are
+        # installed independently: either, both, or none.
+        heating_covers_cooling = False   # a heat pump also does the cooling
+        if not heating_none:
+            if heating_id in hvac_df["ty"].values:
+                hvac_heating_row = hvac_df[hvac_df["ty"] == heating_id]
+                heating_covers_cooling = (not hvac_heating_row.empty and
+                                          float(hvac_heating_row["pHVmx"].iloc[0]) > 0 and
+                                          float(hvac_heating_row["pACmx"].iloc[0]) > 0)
+                if heating_id in df["pHVAC0"].values:
+                    df.loc[df["pHVAC0"] == heating_id, "pHVACz0"] = 1
                 else:
-                    available = df[df["pHVACz0"] != 1].index
-                    if len(available) > 0:
-                        df.iloc[available[0], df.columns.get_loc("pHVAC0")] = cooling_id
-                        df.iloc[available[0], df.columns.get_loc("pHVACz0")] = 1
-                    else:
-                        df.iloc[0, df.columns.get_loc("pHVAC0")] = cooling_id
-                        df.iloc[0, df.columns.get_loc("pHVACz0")] = 1
-        else:
-            if heating_id in df["pCHP0"].values:
-                df.loc[df["pCHP0"] == heating_id, "pCHPz0"] = 1
+                    df.iloc[0, df.columns.get_loc("pHVAC0")] = heating_id
+                    df.iloc[0, df.columns.get_loc("pHVACz0")] = 1
             else:
-                df.iloc[0, df.columns.get_loc("pCHP0")] = heating_id
-                df.iloc[0, df.columns.get_loc("pCHPz0")] = 1
+                if heating_id in df["pCHP0"].values:
+                    df.loc[df["pCHP0"] == heating_id, "pCHPz0"] = 1
+                else:
+                    df.iloc[0, df.columns.get_loc("pCHP0")] = heating_id
+                    df.iloc[0, df.columns.get_loc("pCHPz0")] = 1
 
-            if not cooling_none and not cooling_ducted_hp:
-                if cooling_id in df["pHVAC0"].values:
-                    df.loc[df["pHVAC0"] == cooling_id, "pHVACz0"] = 1
+        if not cooling_none and not cooling_ducted_hp and not heating_covers_cooling:
+            if cooling_id in df["pHVAC0"].values:
+                df.loc[df["pHVAC0"] == cooling_id, "pHVACz0"] = 1
+            else:
+                available = df[df["pHVACz0"] != 1].index
+                if len(available) > 0:
+                    df.iloc[available[0], df.columns.get_loc("pHVAC0")] = cooling_id
+                    df.iloc[available[0], df.columns.get_loc("pHVACz0")] = 1
                 else:
-                    available = df[df["pHVACz0"] != 1].index
-                    if len(available) > 0:
-                        df.iloc[available[0], df.columns.get_loc("pHVAC0")] = cooling_id
-                        df.iloc[available[0], df.columns.get_loc("pHVACz0")] = 1
-                    else:
-                        df.iloc[0, df.columns.get_loc("pHVAC0")] = cooling_id
-                        df.iloc[0, df.columns.get_loc("pHVACz0")] = 1
+                    df.iloc[0, df.columns.get_loc("pHVAC0")] = cooling_id
+                    df.iloc[0, df.columns.get_loc("pHVACz0")] = 1
 
     # --- Water heater ---
     df["pWHz0"] = 0
@@ -1011,8 +973,7 @@ def create_topo_file(output_dir, template, sp_df=None):
         for chp_name in installed:
             if chp_name not in existing:
                 new_row = {
-                    "up": chp_name, "lo": "Building", "in": "hot air",
-                    "fuel": 0, "mx": 0, "hr": 0, "eff": 1,
+                    "up": chp_name, "lo": "Building", "in": "hot air", "eff": 1,
                 }
                 df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         df = pd.concat([df, zeros_row], ignore_index=True)
@@ -1080,21 +1041,22 @@ def process_building(args):
         except Exception:
             pass
 
-        output_dir = (_worker_state["study_dir"] / "decarb" / case_name
-                      / str(bldg_id) / "update_0" / "in")
+        output_dir = _worker_state["study_dir"] / "decarb" / case_name / str(bldg_id) / "in"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        if outputs["tm"]:
+        if outputs["tm"] or outputs["cfg"]:     # cfg.csv pP0 follows tm.csv
             tm_df = generate_tm_data(
                 consumption_df, setpoint_df, building_row, schedule_df,
                 tariff, dcfg)
+        if outputs["tm"]:
             create_tm_file(tm_df, output_dir)
 
         if outputs["bdg_ii"]:
-            create_bdg_ii_file(output_dir, bldg_id, regression_coeffs, dcfg["timestep"])
+            create_bdg_ii_file(output_dir, bldg_id, regression_coeffs)
 
-        if outputs["in"]:
-            create_in_file(output_dir, templates["in"], consumption_df)
+        if outputs["cfg"]:
+            create_cfg_file(output_dir, templates["cfg"], consumption_df, tm_df,
+                            dcfg["timestep"])
 
         if outputs["other"]:
             create_other_files(output_dir, templates, has_solar=has_solar)
@@ -1109,7 +1071,8 @@ def process_building(args):
 
         if outputs["hvac"] or outputs["sp"]:
             hvac_df = _build_hvac_df(
-                templates["hvac"], bldg_id, hp_summary_df, building_row)
+                templates["hvac"], bldg_id, hp_summary_df, building_row,
+                setpoint_df=setpoint_df)
             if outputs["hvac"]:
                 hvac_df.to_csv(str(output_dir / "hvac.csv"), index=False)
 
@@ -1156,7 +1119,7 @@ def process_building(args):
                     # (warned once in run_decarb_inputs)
                     alt = elevation_cache.get((lat, lon), 0.0)
                     pv_tilt, pv_azimuth = compute_optimal_orientation(
-                        lat, lon, alt, cfg["timezone"], tm_for_orient)
+                        lat, lon, alt, dcfg["timestep"], tm_for_orient)
                 except Exception as e:
                     log.warning(f"Building {bldg_id}: PV orientation failed "
                                 f"({type(e).__name__}: {e}); using fallback "
@@ -1216,8 +1179,8 @@ def _required_template_files(outputs):
     files = []
     if outputs["bdg_i"]:
         files.append("bdg_i.csv")
-    if outputs["in"]:
-        files.append("in.csv")
+    if outputs["cfg"]:
+        files.append("cfg.csv")
     if outputs["other"]:
         files += OTHER_TEMPLATE_FILES
     if outputs["chp"] or outputs["sp"]:
@@ -1262,16 +1225,18 @@ def _check_required_files(cfg, dcfg, building_ids, metadata_df, hp_summary_df):
     meta_ids = set(metadata_df[id_col].astype(int))
     hp_ids = set(hp_summary_df["bldg_id"].astype(int))
     needs_hp = outputs["chp"] or outputs["hvac"] or outputs["sp"]
+    needs_tm = outputs["tm"] or outputs["cfg"]   # cfg.csv is built from the tm.csv data
 
     checks = [
         ("ResStock profile (residential_profiles)", lambda b: f"{b}-0.parquet" in profiles),
         ("ResStock metadata row", lambda b: b in meta_ids),
     ]
-    if outputs["tm"]:
-        checks += [
-            ("setpoint file (schedules stage)", lambda b: f"setpoint_{b}.parquet" in setpoints),
-            ("schedule file (schedules stage)", lambda b: f"schedule_{b}.parquet" in schedules),
-        ]
+    if needs_tm or needs_hp:   # hvac.csv uses the comfort band too
+        checks.append(
+            ("setpoint file (schedules stage)", lambda b: f"setpoint_{b}.parquet" in setpoints))
+    if needs_tm:
+        checks.append(
+            ("schedule file (schedules stage)", lambda b: f"schedule_{b}.parquet" in schedules))
     if needs_hp:
         checks.append(("heat pump summary row", lambda b: b in hp_ids))
 
@@ -1329,22 +1294,18 @@ def run_decarb_inputs(cfg, dcfg=None, study_dir=None):
             f"outputs.bdg_ii: false in decarb.yaml.")
 
     if outputs["bdg_ii"]:
-        if TIMESTEP_FIT_STEPS[timestep] == 1:
-            log.info("bdg_ii: thermal coefficients written as fitted (15-min steps)")
-        else:
-            log.info(f"bdg_ii: 15-min thermal coefficients converted to {timestep} "
-                     f"steps ({TIMESTEP_FIT_STEPS[timestep]} fit steps per DECARB step)")
+        log.info(f"bdg_ii: thermal coefficients written as fitted, pBtime = "
+                 f"{THERMAL_FIT_HOURS} h; DECARB converts them to {timestep} steps")
 
-    if dcfg.get("rooftop_solar", {}).get("enabled", False):
-        tz = cfg.get("timezone")
-        if not tz:
-            raise KeyError("config.yaml is missing timezone (needed for rooftop PV "
-                           "orientation), e.g. timezone: \"America/Chicago\"")
-        try:
-            pd.Timestamp(f"{year}-01-01").tz_localize(tz)
-        except Exception as e:
-            raise ValueError(f"timezone {tz!r} in config.yaml is not a valid IANA "
-                             f"time zone name: {e}") from e
+    tz = cfg.get("timezone")
+    if not tz:
+        raise KeyError("config.yaml is missing timezone (local clock for TOU peak "
+                       "hours and DECARB output dates), e.g. timezone: \"America/Chicago\"")
+    try:
+        pd.Timestamp(f"{year}-01-01").tz_localize(tz)
+    except Exception as e:
+        raise ValueError(f"timezone {tz!r} in config.yaml is not a valid IANA "
+                         f"time zone name: {e}") from e
 
     if study_dir is not None:
         study_dir = Path(study_dir)
