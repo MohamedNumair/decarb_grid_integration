@@ -19,9 +19,9 @@ ZONE_PATTERN = re.compile(r"^P\d+[RU]$")
 def load_county_shapefile(shapefile_path):
     if not Path(shapefile_path).exists():
         raise FileNotFoundError(
-            f"County shapefile not found: {shapefile_path}. It is not downloaded "
-            f"automatically; place it there (with its .dbf/.shx/.prj files) or set "
-            f"paths.county_shapefile in config.yaml (see README, Input data).")
+            f"County shapefile not found: {shapefile_path}. It ships with the repo in "
+            f"in/us_county_boundaries/; check paths.county_shapefile in config.yaml "
+            f"(see README, Input data).")
     counties = gpd.read_file(str(shapefile_path))
     counties = counties.to_crs(epsg=4326)
     log.info(f"Loaded {len(counties)} counties from shapefile")

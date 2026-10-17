@@ -1,9 +1,12 @@
 # Building-Grid Integration Pipeline
 
-Models residential electrification and rooftop solar on a distribution network. ResStock buildings are fitted with a thermal model, matched to the residential loads of a SMART-DS feeder zone, optimized with DECARB, and fed back into OpenDSS as hourly or 15-minute load profiles.
+This Python-based pipeline is designed to integrate [DECARB](https://github.com/pduenas/decarb/tree/main), a Julia-based optimization model for planning building energy use, and various Julia-based electricity network optimization models, such as [OpenDSSDirect](https://github.com/dss-extensions/OpenDSSDirect.jl) and [GenX](https://genxproject.github.io/GenX.jl/stable/). The pipeline makes it easy to create bookend cases for DECARB to investigate the downstream network effects of various demand-side policies (such as tariffs or rebates) and relevant scenarios concerning residential energy use (such as heating electrification and proliferation of rooftop PV panels). It uses a backend of [ResStock building profiles](https://resstock.nlr.gov/) and [a combined synthetic dataset of the Texas transmission and distribution networks](https://electricgrids.engr.tamu.edu/combined-td-synthetic-dataset/). 
+
+The residential buildings in an area of concern (such as a feeder or zone in a distribution model or an entire state in a transmission-generation model) are matched to the load buses in the synthetic grid based on their demand profiles, fitted with a simple thermal model based on their ResStock consumption profiles, and are optimized with DECARB to then fed back into OpenDSSDirect or GenX 
+for network level analysis.
 
 ```
-preprocess  ->  decarb-inputs  ->  DECARB (Julia)  ->  network-inputs  ->  opendss  ->  results
+preprocess  ->  decarb-inputs  ->  DECARB (Julia)  ->  network-inputs  ->  OpenDSSDirect or GenX (Julia)  ->  results
 ```
 
 The zone workflow (`scope: "zone"`, OpenDSS) is the maintained path. The statewide GenX path (`scope: "statewide"`) is not up to date.
@@ -18,7 +21,7 @@ The zone workflow (`scope: "zone"`, OpenDSS) is the maintained path. The statewi
 pip install -r requirements.txt
 ```
 
-**Julia + DECARB** (only for the DECARB optimizer step): Julia 1.10+ and the DECARB repository, with its environment instantiated (`julia --project=<DECARB folder> -e "using Pkg; Pkg.instantiate()"`). Gurobi needs a license; HiGHS is free and installed with DECARB.
+**Julia + DECARB**: Julia 1.10+ and the DECARB repository, with its environment instantiated (`julia --project=<DECARB folder> -e "using Pkg; Pkg.instantiate()"`). Gurobi needs a license; HiGHS is free and installed with DECARB.
 
 ## 2. Input data
 
@@ -30,14 +33,13 @@ Downloaded automatically by the data acquisition stage. Everything is public, an
 | ResStock 15-min building profiles | same | `in/residential_profiles/{STATE}/` |
 | SMART-DS feeder network (`.dss` files for the zone) | OEDI S3, `smartds` settings in `config.yaml` | `paths.network_dir` (default `in/smartds/`) |
 
-Provided by you:
+Included in the repo:
 
-| File | What it is | Where it goes |
+| File | What it is | Location (setting) |
 |---|---|---|
-| NEEP heat pump database | NEEP cold-climate ASHP product list export (CSV or Excel). Must include the `Brand Name`, `Status`, `HSPF (Region IV)` and the rated/min/max capacity and COP columns at 5/17/47/82/95 °F | `in/neep_database.csv`, or set `heatpump.neep_database` |
-| County shapefile | County polygons for the network's state, with fields `name`, `statefp`, `countyfp` (e.g. the OpenDataSoft "US County Boundaries" export) | `paths.county_shapefile` |
-
-Included in the repo: the DECARB input templates (`in/decarb_templates/`, `template_dir` in `decarb.yaml`). Their equipment costs and efficiencies are model inputs; see [docs/modeling_notes.md](docs/modeling_notes.md) section 4.
+| DECARB input templates | Equipment catalogs and model settings for DECARB. Their costs and efficiencies are model inputs; see [docs/modeling_notes.md](docs/modeling_notes.md) section 4 | `in/decarb_templates/` (`template_dir` in `decarb.yaml`) |
+| NEEP heat pump database | NEEP cold-climate ASHP product list export, used for heat pump selection. A replacement needs the `Brand Name`, `Status`, `HSPF (Region IV)` and the rated/min/max capacity and COP columns at 5/17/47/82/95 °F | `in/neep_database.csv` (`heatpump.neep_database`) |
+| County shapefile | US county polygons (OpenDataSoft "US County Boundaries"), fields `name`, `statefp`, `countyfp`; used to assign feeder loads to counties | `in/us_county_boundaries/` (`paths.county_shapefile`) |
 
 The building state and the network do not have to match. For example, NY or MA buildings on Texas feeders is a normal setup.
 

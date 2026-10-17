@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 in/*
 !in/decarb_templates/
+!in/neep_database.csv
+!in/us_county_boundaries/
 out/
 *.parquet
 *.7z

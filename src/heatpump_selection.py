@@ -383,8 +383,8 @@ def run_heatpump_selection(cfg):
 
     if not neep_path.exists():
         raise FileNotFoundError(
-            f"NEEP heat pump database not found: {neep_path}. Put the NEEP CSV/Excel "
-            f"there, or set heatpump.neep_database in config.yaml to its path.")
+            f"NEEP heat pump database not found: {neep_path}. It ships with the repo as "
+            f"in/neep_database.csv; check heatpump.neep_database in config.yaml.")
 
     hp_base = load_neep_heat_pumps(neep_path)
 
