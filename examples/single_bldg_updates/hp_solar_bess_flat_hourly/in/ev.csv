@@ -1,0 +1,10 @@
+ty,mx,drv,cold,up,dn,effu,effd
+Short_Range_PHEV,6,0.207124246,0.025,3.6,0,0.9,0.9
+Long_Range_PHEV,12,0.207124246,0.025,3.6,0,0.9,0.9
+Short_Range_Low_Efficiency_AEV,46.3,0.257,0.025,11,11,0.9,0.9
+Medium_Range_Low_Efficiency_AEV,79,0.208,0.025,11,11,0.9,0.9
+Long_Range_Low_Efficiency_AEV,105.2,0.208,0.025,11,11,0.9,0.9
+Short_Range_High_Efficiency_AEV,36.6,0.146,0.025,11,11,0.9,0.9
+Medium_Range_High_Efficiency_AEV,60,0.158,0.025,11,11,0.9,0.9
+Long_Range_High_Efficiency_AEV,75,0.138,0.025,11,11,0.9,0.9
+0,0,0,0,0,0,0,0

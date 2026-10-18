@@ -1,0 +1,2 @@
+Building 9128: Mitsubishi ASHP, rooftop PV (19 x Tesla_Cash panels, pipeline sizing), one TeslaPowerwall_Cash installed. Tariff: tou. 15-min, Jun 1 - Aug 31 2018 (8832 periods).
+From study_2/decarb/tou_heat_100_solar_100/9128/in; changed sp.csv (battery installed), bdg_i.csv (pBbess 1); tm.csv and cfg.csv regenerated with the pipeline (timestep 15min, date_range Jun 1 - Aug 31).

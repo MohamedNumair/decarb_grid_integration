@@ -1,0 +1,2 @@
+Building 9128: Mitsubishi ASHP, rooftop PV (19 x Tesla_Cash panels, pipeline sizing), one TeslaPowerwall_Cash installed. Tariff: flat. Hourly, full year 2018.
+From study_2/decarb/flat_heat_100_solar_100/9128/in; changed sp.csv (battery installed), bdg_i.csv (pBbess 1).

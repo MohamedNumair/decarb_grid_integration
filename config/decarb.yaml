@@ -28,7 +28,7 @@ tariffs:
   - name: "tou"
     type: "tou"
     rate: 0.16              # $/kWh off-peak
-    sell_rate: 0.18
+    sell_rate: 0.15         # below the off-peak price, so buying to sell back never pays
     peak_windows:           # two peak windows per day
       - start: "06:00"
         end: "10:00"
@@ -47,7 +47,7 @@ tariffs:
   - name: "tou_cap"
     type: "tou"
     rate: 0.16
-    sell_rate: 0.18
+    sell_rate: 0.15         # below the off-peak price, so buying to sell back never pays
     peak_windows:
       - start: "06:00"
         end: "10:00"

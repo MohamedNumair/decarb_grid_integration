@@ -243,7 +243,7 @@ for (case_idx, case_name) in enumerate(all_cases)
 
     # ── Update summary ──────────────────────────────────────────
     elapsed_total = time() - t_start
-    log_msg("  Case done in $(fmt(elapsed_total)) — $n_received / $n_total completed")
+    log_msg("  Case done in $(fmt(elapsed_total)) — $n_received / $n_total completed (solved or failed), $(n_total - n_received) not run")
 
     # ── Deduplicate failed_buildings.csv ─────────────────
     if isfile(failed_csv)
@@ -259,9 +259,20 @@ end
 log_msg("═"^70)
 log_msg("ALL CASES COMPLETE")
 log_msg("═"^70)
+# completed = ran to the end (solved, or failed with an error);
+# not run = never finished (stalled, or skipped after a stall)
 for case_name in all_cases
-    case_dir = joinpath(STUDY_DIR, case_name)
-    done = count(d -> isfile(joinpath(case_dir, d, "out", "ts.csv")), readdir(case_dir))
-    log_msg("  $case_name: $done completed")
+    case_dir  = joinpath(STUDY_DIR, case_name)
+    bldgs     = filter(d -> isdir(joinpath(case_dir, d, "in")), readdir(case_dir))
+    solved    = Set(filter(d -> isfile(joinpath(case_dir, d, "out", "ts.csv")), bldgs))
+    failed_csv = joinpath(case_dir, "failed_buildings.csv")
+    failed = isfile(failed_csv) ?
+        setdiff(Set(string.(CSV.read(failed_csv, DataFrame; header = 1,
+                                     normalizenames = true).bldg_id)), solved) :
+        Set{String}()
+    failed  = intersect(failed, Set(bldgs))
+    not_run = length(bldgs) - length(solved) - length(failed)
+    log_msg("  $case_name: $(length(solved) + length(failed)) / $(length(bldgs)) completed " *
+            "($(length(solved)) solved, $(length(failed)) failed), $not_run not run")
 end
 log_msg("Log file: $LOG_FILE")

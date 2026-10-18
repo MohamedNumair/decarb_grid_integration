@@ -156,43 +156,23 @@ def build_substation_lookup(building_map_df):
 # DECARB output reading
 # ---------------------------------------------------------------------------
 
-ENERGY_PER_PERIOD_COLS = ("buy", "sell")
-
-
-def period_hours(decarb_case_dir, bldg_id):
-    """Length of each DECARB period [h], from the building's inputs: cfg.csv
-    pP0 and the tm.csv pP period ends (UTC)."""
-    in_dir = decarb_case_dir / str(bldg_id) / "in"
-    cfg = pd.read_csv(in_dir / "cfg.csv", header=None, index_col=0)[1]
-    ends = pd.to_datetime(pd.read_csv(in_dir / "tm.csv", usecols=["pP"])["pP"])
-    bounds = pd.concat([pd.Series([pd.to_datetime(cfg["pP0"])]), ends], ignore_index=True)
-    return bounds.diff().dropna().dt.total_seconds().to_numpy() / 3600
-
-
 def read_decarb_ts(decarb_case_dir, bldg_id):
     """Read DECARB optimizer output timeseries for a building.
 
     The DECARB optimizer writes ts.csv with columns like:
-    buy, sell, hvac_HT, hvac_AC, pv, etc. All are average kW per period except
-    buy and sell, which DECARB writes as kWh per period; they are converted to
-    kW here (no change for hourly periods).
+    buy, sell, hvac_HT, hvac_AC, pv, etc., all average kW per period
+    (vQbuy / vQsell are powers in DECARB's electricity balance).
     """
     ts_path = decarb_case_dir / str(bldg_id) / "out" / "ts.csv"
     if not ts_path.exists():
         return None
     try:
         df = pd.read_csv(str(ts_path))
+        if df.empty:
+            return None
+        return df
     except Exception:
         return None
-    if df.empty:
-        return None
-    hours = period_hours(decarb_case_dir, bldg_id)
-    if len(hours) != len(df):
-        raise ValueError(f"{ts_path}: {len(df)} rows but {len(hours)} periods in its tm.csv")
-    for col in ENERGY_PER_PERIOD_COLS:
-        if col in df.columns:
-            df[col] = df[col] / hours
-    return df
 
 
 def read_decarb_tm(decarb_case_dir, bldg_id):

@@ -1,0 +1,3 @@
+Building 9128: Mitsubishi ASHP 382 plus the existing Natural Gas Fuel Furnace 80% AFUE kept as backup at 10% of the heat pump heating capacity (1.75 kW).
+Fuel prices (pGcost, pLcost) set to 0.23 $/kWh. Tariff: flat_cap. Hourly, full year 2018.
+From study_2/decarb/flat_cap_heat_100_solar_0/9128/in; changed sp.csv (heater installed), chp.csv (heater mx), tm.csv (fuel prices).
